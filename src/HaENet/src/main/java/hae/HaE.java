@@ -20,14 +20,14 @@ public class HaE implements BurpExtension {
     @Override
     public void initialize(MontoyaApi api) {
         // 设置扩展名称
-        api.extension().setName("HaE - Highlighter and Extractor");
-        String version = "4.3.3";
+        api.extension().setName("HaE-Storage - Highlighter and Extractor");
+        String version = "1.0.0";
 
         // 加载扩展后输出的项目信息
         Logging logging = api.logging();
-        logging.logToOutput("[ HACK THE WORLD - TO DO IT ]");
-        logging.logToOutput("[#] Author: EvilChen && 0chencc && vaycore");
-        logging.logToOutput("[#] Github: https://github.com/gh0stkey/HaE");
+        logging.logToOutput("[ HaE-Storage ]");
+        logging.logToOutput("[#] Author: RecoveryAshes");
+        logging.logToOutput("[#] Github: https://github.com/RecoveryAshes/HaE-Storage");
         logging.logToOutput("[#] Version: " + version);
 
         // 配置文件加载
