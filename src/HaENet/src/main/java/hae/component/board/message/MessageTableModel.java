@@ -1,6 +1,9 @@
 package hae.component.board.message;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.Annotations;
+import burp.api.montoya.core.HighlightColor;
+import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -11,12 +14,11 @@ import hae.Config;
 import hae.instances.http.utils.MessageProcessor;
 import hae.storage.SqliteMessageStore;
 import hae.utils.ConfigLoader;
-import hae.utils.string.HashCalculator;
+import hae.utils.http.HttpUtils;
 import hae.utils.string.StringProcessor;
 
 import javax.swing.*;
 import javax.swing.table.AbstractTableModel;
-import javax.swing.table.DefaultTableModel;
 import javax.swing.table.TableModel;
 import javax.swing.table.TableRowSorter;
 import java.awt.BorderLayout;
@@ -24,26 +26,36 @@ import java.awt.FlowLayout;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Pattern;
 
 import static burp.api.montoya.ui.editor.EditorOptions.READ_ONLY;
 
 public class MessageTableModel extends AbstractTableModel {
     private static final int DEFAULT_PAGE_SIZE = 100;
+    private static final int REGEX_WORKER_COUNT = 2;
+    private static final int REGEX_QUEUE_CAPACITY = 10000;
+    private static final int PENDING_ANNOTATION_CAPACITY = 10000;
+    private static final int PENDING_RECOVERY_BATCH_SIZE = 200;
+    private static final long PENDING_RECOVERY_IDLE_MILLIS = 5000L;
 
     private final MontoyaApi api;
     private final ConfigLoader configLoader;
     private final SqliteMessageStore messageStore;
     private final MessageProcessor messageProcessor;
+    private final HttpUtils httpUtils;
     private final MessageTable messageTable;
     private final JSplitPane splitPane;
     private final LinkedList<MessageEntry> pageLog;
@@ -65,6 +77,12 @@ public class MessageTableModel extends AbstractTableModel {
     private SwingWorker<Void, Void> currentWorker;
     private SwingWorker<PageQueryResult, Void> pageWorker;
     private final AtomicInteger queryVersion = new AtomicInteger(0);
+    private final BlockingQueue<String> regexQueue = new LinkedBlockingQueue<>(REGEX_QUEUE_CAPACITY);
+    private final Set<String> queuedRegexMessageIds = ConcurrentHashMap.newKeySet();
+    private final ExecutorService regexExecutorService;
+    private final AtomicBoolean regexWorkerRunning = new AtomicBoolean(true);
+    private final AtomicBoolean pageRefreshQueued = new AtomicBoolean(false);
+    private final Map<String, Annotations> pendingAnnotations = Collections.synchronizedMap(new LinkedHashMap<>());
 
     private static class PageQueryResult {
         private final List<MessageEntry> entries;
@@ -78,12 +96,26 @@ public class MessageTableModel extends AbstractTableModel {
         }
     }
 
+    private static class RequestMetadata {
+        private final String url;
+        private final String host;
+        private final String urlParseError;
+
+        private RequestMetadata(String url, String host, String urlParseError) {
+            this.url = url;
+            this.host = host;
+            this.urlParseError = urlParseError;
+        }
+    }
+
     public MessageTableModel(MontoyaApi api, ConfigLoader configLoader) {
         this.api = api;
         this.configLoader = configLoader;
         this.messageStore = new SqliteMessageStore(api, configLoader);
         this.messageProcessor = new MessageProcessor(api, configLoader);
+        this.httpUtils = new HttpUtils(api, configLoader);
         this.pageLog = new LinkedList<>();
+        this.regexExecutorService = Executors.newFixedThreadPool(REGEX_WORKER_COUNT);
 
         UserInterface userInterface = api.userInterface();
         HttpRequestEditor requestViewer = userInterface.createHttpRequestEditor(READ_ONLY);
@@ -97,7 +129,7 @@ public class MessageTableModel extends AbstractTableModel {
         messageTable.setDefaultRenderer(Object.class, new MessageRenderer(pageLog, messageTable));
         messageTable.setAutoCreateRowSorter(true);
 
-        TableRowSorter<DefaultTableModel> sorter = getDefaultTableModelTableRowSorter();
+        TableRowSorter<TableModel> sorter = getDefaultTableModelTableRowSorter();
         messageTable.setRowSorter(sorter);
         messageTable.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
 
@@ -112,6 +144,7 @@ public class MessageTableModel extends AbstractTableModel {
         splitPane.setRightComponent(messagePane);
 
         updatePaginationControls();
+        startRegexWorkers();
     }
 
     private JPanel createPaginationPanel() {
@@ -276,12 +309,225 @@ public class MessageTableModel extends AbstractTableModel {
         currentMessageFilter = "";
     }
 
-    private TableRowSorter<DefaultTableModel> getDefaultTableModelTableRowSorter() {
-        TableRowSorter<DefaultTableModel> sorter = (TableRowSorter<DefaultTableModel>) messageTable.getRowSorter();
+    private void startRegexWorkers() {
+        for (int i = 0; i < REGEX_WORKER_COUNT; i++) {
+            regexExecutorService.execute(this::runRegexWorker);
+        }
+        recoverPendingRegexWork();
+    }
 
-        sorter.setComparator(4, (Comparator<String>) (s1, s2) -> {
-            Integer length1 = Integer.parseInt(s1);
-            Integer length2 = Integer.parseInt(s2);
+    private void runRegexWorker() {
+        while (regexWorkerRunning.get() && !Thread.currentThread().isInterrupted()) {
+            String messageId = null;
+            try {
+                messageId = regexQueue.poll(PENDING_RECOVERY_IDLE_MILLIS, TimeUnit.MILLISECONDS);
+                if (messageId == null) {
+                    recoverPendingRegexWork();
+                    continue;
+                }
+
+                queuedRegexMessageIds.remove(messageId);
+                processRegexMessage(messageId);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                api.logging().logToError("runRegexWorker: " + e.getMessage());
+                if (messageId != null) {
+                    messageStore.failRegexProcessing(messageId, e.getMessage());
+                }
+            }
+        }
+    }
+
+    private void recoverPendingRegexWork() {
+        List<String> pendingIds = messageStore.loadPendingRegexMessageIds(PENDING_RECOVERY_BATCH_SIZE);
+        for (String pendingId : pendingIds) {
+            enqueueRegexMessage(pendingId);
+        }
+    }
+
+    private void enqueueRegexMessage(String messageId) {
+        if (messageId == null || messageId.isBlank()) {
+            return;
+        }
+
+        if (queuedRegexMessageIds.add(messageId) && !regexQueue.offer(messageId)) {
+            queuedRegexMessageIds.remove(messageId);
+        }
+    }
+
+    private void processRegexMessage(String messageId) {
+        if (!messageStore.markRegexProcessing(messageId)) {
+            return;
+        }
+
+        try {
+            SqliteMessageStore.StoredMessage storedMessage = messageStore.loadStoredMessage(messageId);
+            if (storedMessage == null || storedMessage.getRequestResponse() == null) {
+                messageStore.failRegexProcessing(messageId, "Stored message is unavailable");
+                return;
+            }
+
+            HttpRequestResponse requestResponse = storedMessage.getRequestResponse();
+            MessageProcessor.ProcessedMessage processedMessage = messageProcessor.processRequestResponse(
+                    storedMessage.getHost(),
+                    requestResponse.request(),
+                    requestResponse.response()
+            );
+
+            if (!processedMessage.hasMatches()) {
+                if (!messageStore.completeRegexProcessing(messageId, "", "none", Collections.emptyMap())) {
+                    messageStore.resetRegexProcessing(messageId, "Unable to mark unmatched regex processing as complete");
+                    enqueueRegexMessage(messageId);
+                }
+                removePendingAnnotation(messageId);
+                return;
+            }
+
+            boolean completed = messageStore.completeRegexProcessing(
+                    messageId,
+                    processedMessage.getComment(),
+                    processedMessage.getColor(),
+                    processedMessage.getExtractedDataByRule()
+            );
+            if (completed) {
+                applyPendingAnnotation(messageId, processedMessage);
+                refreshCurrentPageLater();
+            } else {
+                messageStore.resetRegexProcessing(messageId, "Unable to complete regex processing");
+                enqueueRegexMessage(messageId);
+            }
+        } catch (Exception e) {
+            messageStore.failRegexProcessing(messageId, e.getMessage());
+            removePendingAnnotation(messageId);
+            api.logging().logToError("processRegexMessage: " + e.getMessage());
+        }
+    }
+
+    private void applyPendingAnnotation(String messageId, MessageProcessor.ProcessedMessage processedMessage) {
+        Annotations annotations = removePendingAnnotation(messageId);
+        if (annotations == null || processedMessage == null || !processedMessage.hasMatches()) {
+            return;
+        }
+
+        try {
+            annotations.setHighlightColor(HighlightColor.highlightColor(processedMessage.getColor()));
+            annotations.setNotes(processedMessage.getComment());
+        } catch (Exception e) {
+            api.logging().logToError("applyPendingAnnotation: " + e.getMessage());
+        }
+    }
+
+    private Annotations removePendingAnnotation(String messageId) {
+        if (messageId == null || messageId.isBlank()) {
+            return null;
+        }
+
+        synchronized (pendingAnnotations) {
+            return pendingAnnotations.remove(messageId);
+        }
+    }
+
+    private void refreshCurrentPageLater() {
+        if (!pageRefreshQueued.compareAndSet(false, true)) {
+            return;
+        }
+
+        SwingUtilities.invokeLater(() -> {
+            pageRefreshQueued.set(false);
+            loadPageFromCurrentState(false);
+        });
+    }
+
+    private RequestMetadata buildRequestMetadata(HttpRequest request) {
+        HttpService service = request.httpService();
+        String fallbackHost = service == null ? "" : service.host();
+        String fallbackUrl = buildFallbackUrl(request, service);
+
+        try {
+            String url = request.url();
+            String host = StringProcessor.getHostByUrl(url);
+            if (host == null || host.isBlank()) {
+                host = fallbackHost;
+            }
+            return new RequestMetadata(url, host, "");
+        } catch (Exception e) {
+            return new RequestMetadata(fallbackUrl, fallbackHost, e.getMessage());
+        }
+    }
+
+    private String buildFallbackUrl(HttpRequest request, HttpService service) {
+        if (service == null) {
+            return safePath(request);
+        }
+
+        String scheme = service.secure() ? "https" : "http";
+        String host = service.host() == null ? "" : service.host();
+        int port = service.port();
+        String path = safePath(request);
+        StringBuilder builder = new StringBuilder();
+        builder.append(scheme).append("://").append(host);
+        if (port > 0 && !isDefaultPort(port, service.secure())) {
+            builder.append(":").append(port);
+        }
+        if (path == null || path.isBlank()) {
+            builder.append("/");
+        } else if (path.startsWith("/")) {
+            builder.append(path);
+        } else {
+            builder.append("/").append(path);
+        }
+        return builder.toString();
+    }
+
+    private boolean isDefaultPort(int port, boolean secure) {
+        return (secure && port == 443) || (!secure && port == 80);
+    }
+
+    private String safePath(HttpRequest request) {
+        try {
+            String path = request.path();
+            return path == null || path.isBlank() ? "/" : path;
+        } catch (Exception e) {
+            api.logging().logToError("safePath: " + e.getMessage());
+            return "/";
+        }
+    }
+
+    private String safeMethod(HttpRequest request) {
+        try {
+            String method = request.method();
+            return method == null ? "" : method;
+        } catch (Exception e) {
+            api.logging().logToError("safeMethod: " + e.getMessage());
+            return "";
+        }
+    }
+
+    private String safeStatus(HttpResponse response) {
+        try {
+            return String.valueOf(response.statusCode());
+        } catch (Exception e) {
+            api.logging().logToError("safeStatus: " + e.getMessage());
+            return "";
+        }
+    }
+
+    private String safeLength(HttpResponse response) {
+        try {
+            return String.valueOf(response.toByteArray().length());
+        } catch (Exception e) {
+            api.logging().logToError("safeLength: " + e.getMessage());
+            return "0";
+        }
+    }
+
+    private TableRowSorter<TableModel> getDefaultTableModelTableRowSorter() {
+        TableRowSorter<TableModel> sorter = new TableRowSorter<>(this);
+
+        sorter.setComparator(4, (value1, value2) -> {
+            Integer length1 = Integer.parseInt(value1 == null ? "0" : value1.toString());
+            Integer length2 = Integer.parseInt(value2 == null ? "0" : value2.toString());
             return length1.compareTo(length2);
         });
 
@@ -305,97 +551,72 @@ public class MessageTableModel extends AbstractTableModel {
         return sorter;
     }
 
-    public synchronized void add(HttpRequestResponse messageInfo, String url, String method, String status, String length, String comment, String color, boolean flag) {
+    public synchronized void add(HttpRequestResponse messageInfo, boolean flag) {
+        add(messageInfo, flag, null, "");
+    }
+
+    public synchronized void add(HttpRequestResponse messageInfo, boolean flag, Annotations annotations) {
+        add(messageInfo, flag, annotations, "");
+    }
+
+    public synchronized void add(HttpRequestResponse messageInfo, boolean flag, Annotations annotations, String toolType) {
         if (messageInfo == null) {
             return;
         }
 
-        if (comment == null || comment.trim().isEmpty()) {
+        HttpRequest request = messageInfo.request();
+        HttpResponse response = messageInfo.response();
+        if (request == null || response == null) {
             return;
         }
 
-        if (color == null || color.trim().isEmpty()) {
+        RequestMetadata requestMetadata = buildRequestMetadata(request);
+        String method = safeMethod(request);
+        String status = safeStatus(response);
+        String length = safeLength(response);
+        String filterReason = httpUtils.getFilterReason(messageInfo, toolType == null ? "" : toolType);
+        if (!filterReason.isBlank()) {
             return;
         }
-
-        String contentHash = calculateMessageHash(messageInfo);
         String messageId = StringProcessor.getRandomUUID();
 
-        if (flag && messageStore.existsDuplicate(url, comment, color, contentHash)) {
-            return;
-        }
-
         if (flag) {
-            Map<String, List<String>> extractedDataByRule = buildExtractedDataByRule(messageInfo);
-            messageStore.saveMessage(messageId, messageInfo, url, method, status, length, comment, color, contentHash, extractedDataByRule);
-        }
+            SqliteMessageStore.PendingMessageSaveResult saveResult = messageStore.savePendingMessage(
+                    messageId,
+                    messageInfo,
+                    requestMetadata.url,
+                    requestMetadata.host,
+                    method,
+                    status,
+                    length,
+                    "",
+                    requestMetadata.urlParseError,
+                    filterReason,
+                    true
+            );
 
-        loadPageFromCurrentState(false);
+            if (saveResult.isSaved()) {
+                rememberPendingAnnotation(saveResult.getMessageId(), annotations);
+                enqueueRegexMessage(saveResult.getMessageId());
+            }
+        }
     }
 
-    private Map<String, List<String>> buildExtractedDataByRule(HttpRequestResponse messageInfo) {
-        Map<String, Set<String>> mergedMap = new LinkedHashMap<>();
-        try {
-            String host = StringProcessor.getHostByUrl(messageInfo.request().url());
-            appendExtractedData(mergedMap, messageProcessor.processRequest(host, messageInfo.request(), false));
-            appendExtractedData(mergedMap, messageProcessor.processResponse(host, messageInfo.response(), false));
-        } catch (Exception e) {
-            api.logging().logToError("buildExtractedDataByRule: " + e.getMessage());
-        }
-
-        Map<String, List<String>> normalizedMap = new LinkedHashMap<>();
-        for (Map.Entry<String, Set<String>> entry : mergedMap.entrySet()) {
-            normalizedMap.put(entry.getKey(), new ArrayList<>(entry.getValue()));
-        }
-
-        return normalizedMap;
-    }
-
-    private void appendExtractedData(Map<String, Set<String>> mergedMap, List<Map<String, String>> extractedList) {
-        if (extractedList == null || extractedList.isEmpty()) {
+    private void rememberPendingAnnotation(String messageId, Annotations annotations) {
+        if (messageId == null || messageId.isBlank() || annotations == null) {
             return;
         }
 
-        for (Map<String, String> extractedMap : extractedList) {
-            if (extractedMap == null || extractedMap.isEmpty()) {
-                continue;
+        synchronized (pendingAnnotations) {
+            pendingAnnotations.put(messageId, annotations);
+            while (pendingAnnotations.size() > PENDING_ANNOTATION_CAPACITY) {
+                Iterator<String> iterator = pendingAnnotations.keySet().iterator();
+                if (!iterator.hasNext()) {
+                    break;
+                }
+                iterator.next();
+                iterator.remove();
             }
-
-            for (Map.Entry<String, String> entry : extractedMap.entrySet()) {
-                String ruleName = StringProcessor.extractItemName(entry.getKey());
-                if (ruleName == null || ruleName.isBlank()) {
-                    continue;
-                }
-
-                String joinedData = entry.getValue();
-                if (joinedData == null || joinedData.isBlank()) {
-                    continue;
-                }
-
-                Set<String> valueSet = mergedMap.computeIfAbsent(ruleName, ignored -> new LinkedHashSet<>());
-                String[] values = joinedData.split(Pattern.quote(Config.boundary));
-                for (String value : values) {
-                    if (value != null) {
-                        String normalizedValue = value.trim();
-                        if (!normalizedValue.isEmpty()) {
-                            valueSet.add(normalizedValue);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private String calculateMessageHash(HttpRequestResponse messageInfo) {
-        try {
-            byte[] reqBytes = messageInfo.request().toByteArray().getBytes();
-            byte[] resBytes = messageInfo.response().toByteArray().getBytes();
-            byte[] allBytes = new byte[reqBytes.length + resBytes.length];
-            System.arraycopy(reqBytes, 0, allBytes, 0, reqBytes.length);
-            System.arraycopy(resBytes, 0, allBytes, reqBytes.length, resBytes.length);
-            return HashCalculator.calculateHash(allBytes);
-        } catch (Exception e) {
-            return "";
         }
     }
 
@@ -425,6 +646,9 @@ public class MessageTableModel extends AbstractTableModel {
         int deletedCount = messageStore.deleteAllMessages();
 
         resetMessageFilterState();
+        regexQueue.clear();
+        queuedRegexMessageIds.clear();
+        pendingAnnotations.clear();
         if (pageWorker != null && !pageWorker.isDone()) {
             pageWorker.cancel(true);
         }
@@ -447,7 +671,18 @@ public class MessageTableModel extends AbstractTableModel {
             if (pageWorker != null && !pageWorker.isDone()) {
                 pageWorker.cancel(true);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            api.logging().logToError("clearAllDataOnShutdown(cancel): " + e.getMessage());
+        }
+
+        try {
+            regexWorkerRunning.set(false);
+            regexExecutorService.shutdownNow();
+            regexQueue.clear();
+            queuedRegexMessageIds.clear();
+            pendingAnnotations.clear();
+        } catch (Exception e) {
+            api.logging().logToError("clearAllDataOnShutdown(regex): " + e.getMessage());
         }
 
         try {
@@ -458,17 +693,27 @@ public class MessageTableModel extends AbstractTableModel {
             }
             totalRows = 0;
             currentPage = 1;
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            api.logging().logToError("clearAllDataOnShutdown(delete): " + e.getMessage());
         }
 
         try {
             messageTable.shutdown();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            api.logging().logToError("clearAllDataOnShutdown(table): " + e.getMessage());
         }
     }
 
     public String getStoragePath() {
         return messageStore.getDatabasePath();
+    }
+
+    public Map<String, List<String>> loadExtractedDataByHost(String hostPattern) {
+        return messageStore.loadExtractedDataByHost(hostPattern);
+    }
+
+    public List<String> loadMatchedHosts() {
+        return messageStore.loadMatchedHosts();
     }
 
     public void applyHostFilter(String filterText) {
@@ -594,12 +839,13 @@ public class MessageTableModel extends AbstractTableModel {
         }
 
         private void getSelectedMessage() {
+            int selectedIndexSnapshot = lastSelectedIndex;
             MessageEntry messageEntry;
             synchronized (pageLog) {
-                if (lastSelectedIndex < 0 || lastSelectedIndex >= pageLog.size()) {
+                if (selectedIndexSnapshot < 0 || selectedIndexSnapshot >= pageLog.size()) {
                     return;
                 }
-                messageEntry = pageLog.get(lastSelectedIndex);
+                messageEntry = pageLog.get(selectedIndexSnapshot);
             }
 
             HttpRequestResponse httpRequestResponse = messageStore.loadMessage(messageEntry.getMessageId());
@@ -607,13 +853,23 @@ public class MessageTableModel extends AbstractTableModel {
                 return;
             }
 
-            requestEditor.setRequest(HttpRequest.httpRequest(httpRequestResponse.httpService(), httpRequestResponse.request().toByteArray()));
-            int responseSizeWithMb = httpRequestResponse.response().toString().length() / 1024 / 1024;
+            HttpRequest request = HttpRequest.httpRequest(httpRequestResponse.httpService(), httpRequestResponse.request().toByteArray());
+            HttpResponse response = buildDisplayResponse(httpRequestResponse.response());
+            SwingUtilities.invokeLater(() -> {
+                if (lastSelectedIndex != selectedIndexSnapshot) {
+                    return;
+                }
+                requestEditor.setRequest(request);
+                responseEditor.setResponse(response);
+            });
+        }
+
+        private HttpResponse buildDisplayResponse(HttpResponse response) {
+            int responseSizeWithMb = response.toByteArray().length() / 1024 / 1024;
             if ((responseSizeWithMb < Integer.parseInt(configLoader.getLimitSize())) || configLoader.getLimitSize().equals("0")) {
-                responseEditor.setResponse(httpRequestResponse.response());
-            } else {
-                responseEditor.setResponse(HttpResponse.httpResponse("Exceeds length limit."));
+                return response;
             }
+            return HttpResponse.httpResponse("Exceeds length limit.");
         }
     }
 }
