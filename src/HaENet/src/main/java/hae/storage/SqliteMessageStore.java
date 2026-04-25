@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class SqliteMessageStore implements MessageRepository,
@@ -35,6 +36,9 @@ public class SqliteMessageStore implements MessageRepository,
         StorageMaintenanceRepository {
     private static final String TABLE_NAME = "message_history";
     private static final String MATCH_TABLE_NAME = "message_match";
+    private static final String SCOPED_SCOPE_TABLE_NAME = "scoped_databoard_scope";
+    private static final String SCOPED_MESSAGE_TABLE_NAME = "scoped_databoard_message";
+    private static final String SCOPED_MATCH_TABLE_NAME = "scoped_databoard_match";
     private static final String REGEX_STATUS_PENDING = "PENDING";
     private static final String REGEX_STATUS_PROCESSING = "PROCESSING";
     private static final String REGEX_STATUS_DONE = "DONE";
@@ -245,18 +249,70 @@ public class SqliteMessageStore implements MessageRepository,
                 )
                 """, MATCH_TABLE_NAME);
 
+        String createScopedScopeTableSql = String.format("""
+                CREATE TABLE IF NOT EXISTS %s (
+                    scope_id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    label TEXT NOT NULL
+                )
+                """, SCOPED_SCOPE_TABLE_NAME);
+
+        String createScopedMessageTableSql = String.format("""
+                CREATE TABLE IF NOT EXISTS %s (
+                    scope_id TEXT NOT NULL,
+                    scoped_message_id TEXT NOT NULL,
+                    scoped_order INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    host TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    length TEXT NOT NULL,
+                    comment TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    service_host TEXT NOT NULL,
+                    service_port INTEGER NOT NULL,
+                    service_secure INTEGER NOT NULL,
+                    request_bytes BLOB NOT NULL,
+                    response_bytes BLOB NOT NULL,
+                    request_length INTEGER NOT NULL DEFAULT 0,
+                    response_length INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (scope_id, scoped_message_id)
+                )
+                """, SCOPED_MESSAGE_TABLE_NAME);
+
+        String createScopedMatchTableSql = String.format("""
+                CREATE TABLE IF NOT EXISTS %s (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_id TEXT NOT NULL,
+                    scoped_message_id TEXT NOT NULL,
+                    rule_name TEXT NOT NULL,
+                    extracted_value TEXT NOT NULL
+                )
+                """, SCOPED_MATCH_TABLE_NAME);
+
         String createCreatedAtIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %s(created_at)", TABLE_NAME, TABLE_NAME);
         String createHostIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_host ON %s(host)", TABLE_NAME, TABLE_NAME);
         String createHashIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_hash ON %s(content_hash)", TABLE_NAME, TABLE_NAME);
         String createRegexStatusIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_regex_status ON %s(regex_status, created_at)", TABLE_NAME, TABLE_NAME);
         String createMatchMessageIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_message_id ON %s(message_id)", MATCH_TABLE_NAME, MATCH_TABLE_NAME);
         String createMatchRuleValueIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_rule_value ON %s(rule_name, extracted_value)", MATCH_TABLE_NAME, MATCH_TABLE_NAME);
+        String createScopedMessageScopeIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_scope_id ON %s(scope_id)", SCOPED_MESSAGE_TABLE_NAME, SCOPED_MESSAGE_TABLE_NAME);
+        String createScopedMessageIdIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_scoped_message_id ON %s(scoped_message_id)", SCOPED_MESSAGE_TABLE_NAME, SCOPED_MESSAGE_TABLE_NAME);
+        String createScopedMatchScopeIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_scope_id ON %s(scope_id)", SCOPED_MATCH_TABLE_NAME, SCOPED_MATCH_TABLE_NAME);
+        String createScopedMatchMessageIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_message_id ON %s(scope_id, scoped_message_id)", SCOPED_MATCH_TABLE_NAME, SCOPED_MATCH_TABLE_NAME);
+        String createScopedMatchRuleValueIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_scope_rule_value ON %s(scope_id, rule_name, extracted_value)", SCOPED_MATCH_TABLE_NAME, SCOPED_MATCH_TABLE_NAME);
 
         try (Connection connection = getConnection(); Statement statement = connection.createStatement()) {
             statement.execute("PRAGMA journal_mode=WAL");
             statement.execute("PRAGMA synchronous=NORMAL");
             statement.execute(createTableSql);
             statement.execute(createMatchTableSql);
+            statement.execute(createScopedScopeTableSql);
+            statement.execute(createScopedMessageTableSql);
+            statement.execute(createScopedMatchTableSql);
             migrateMessageHistorySchema(connection);
             promoteMigratedMatchedRows(connection);
             resetInterruptedRegexWork(connection);
@@ -266,6 +322,11 @@ public class SqliteMessageStore implements MessageRepository,
             statement.execute(createRegexStatusIndex);
             statement.execute(createMatchMessageIndex);
             statement.execute(createMatchRuleValueIndex);
+            statement.execute(createScopedMessageScopeIndex);
+            statement.execute(createScopedMessageIdIndex);
+            statement.execute(createScopedMatchScopeIndex);
+            statement.execute(createScopedMatchMessageIndex);
+            statement.execute(createScopedMatchRuleValueIndex);
         } catch (Exception e) {
             logDatabaseError("initializeDatabase", e);
         }
@@ -661,6 +722,222 @@ public class SqliteMessageStore implements MessageRepository,
                 insertMatchStatement.setString(1, messageId);
                 insertMatchStatement.setString(2, ruleName);
                 insertMatchStatement.setString(3, extractedValue);
+                insertMatchStatement.addBatch();
+            }
+        }
+
+        insertMatchStatement.executeBatch();
+    }
+
+    public synchronized String createScopedDataboardScope(String source, String label) {
+        String scopeId = UUID.randomUUID().toString();
+        String insertSql = String.format("""
+                INSERT INTO %s (scope_id, created_at, source, label)
+                VALUES (?, ?, ?, ?)
+                """, SCOPED_SCOPE_TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(insertSql)) {
+            statement.setString(1, scopeId);
+            statement.setLong(2, System.currentTimeMillis());
+            statement.setString(3, source == null ? "" : source);
+            statement.setString(4, label == null ? "" : label);
+            statement.executeUpdate();
+            return scopeId;
+        } catch (Exception e) {
+            logDatabaseError("createScopedDataboardScope", e);
+            return null;
+        }
+    }
+
+    public synchronized void saveScopedMessage(String scopeId,
+                                               String scopedMessageId,
+                                               HttpRequestResponse messageInfo,
+                                               String url,
+                                               String host,
+                                               String method,
+                                               String status,
+                                               String length,
+                                               String comment,
+                                               String color,
+                                               String contentHash) {
+        if (scopeId == null || scopeId.isBlank() || scopedMessageId == null || scopedMessageId.isBlank() || messageInfo == null) {
+            return;
+        }
+
+        try {
+            HttpRequest request = messageInfo.request();
+            HttpResponse response = messageInfo.response();
+            if (request == null || response == null) {
+                return;
+            }
+
+            HttpService service = request.httpService();
+            if (service == null) {
+                return;
+            }
+
+            byte[] requestBytes = request.toByteArray().getBytes();
+            byte[] responseBytes = response.toByteArray().getBytes();
+            String safeContentHash = contentHash;
+            if (safeContentHash == null || safeContentHash.isBlank()) {
+                safeContentHash = calculateContentHash(requestBytes, responseBytes);
+            }
+
+            String safeHost = host;
+            if (safeHost == null || safeHost.isBlank()) {
+                safeHost = service.host();
+            }
+
+            String insertSql = String.format("""
+                    INSERT INTO %s (
+                        scope_id, scoped_message_id, scoped_order, created_at, host, url, method, status, length,
+                        comment, color, content_hash, service_host, service_port, service_secure, request_bytes,
+                        response_bytes, request_length, response_length
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, SCOPED_MESSAGE_TABLE_NAME);
+
+            try (Connection connection = getConnection();
+                 PreparedStatement statement = connection.prepareStatement(insertSql)) {
+                statement.setString(1, scopeId);
+                statement.setString(2, scopedMessageId);
+                statement.setLong(3, nextScopedMessageOrder(connection, scopeId));
+                statement.setLong(4, System.currentTimeMillis());
+                statement.setString(5, safeHost == null ? "" : safeHost);
+                statement.setString(6, url == null ? "" : url);
+                statement.setString(7, method == null ? "" : method);
+                statement.setString(8, status == null ? "" : status);
+                statement.setString(9, length == null ? String.valueOf(responseBytes.length) : length);
+                statement.setString(10, comment == null ? "" : comment);
+                statement.setString(11, color == null ? "" : color);
+                statement.setString(12, safeContentHash == null ? "" : safeContentHash);
+                statement.setString(13, service.host());
+                statement.setInt(14, service.port());
+                statement.setInt(15, service.secure() ? 1 : 0);
+                statement.setBytes(16, requestBytes);
+                statement.setBytes(17, responseBytes);
+                statement.setInt(18, requestBytes.length);
+                statement.setInt(19, responseBytes.length);
+                statement.executeUpdate();
+            }
+        } catch (Exception e) {
+            logDatabaseError("saveScopedMessage", e);
+        }
+    }
+
+    public synchronized void saveScopedMatches(String scopeId,
+                                               String scopedMessageId,
+                                               Map<String, List<String>> extractedDataByRule) {
+        if (scopeId == null || scopeId.isBlank() || scopedMessageId == null || scopedMessageId.isBlank()) {
+            return;
+        }
+
+        String deleteSql = String.format("DELETE FROM %s WHERE scope_id = ? AND scoped_message_id = ?", SCOPED_MATCH_TABLE_NAME);
+        String insertSql = String.format("""
+                INSERT INTO %s (scope_id, scoped_message_id, rule_name, extracted_value)
+                VALUES (?, ?, ?, ?)
+                """, SCOPED_MATCH_TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement deleteStatement = connection.prepareStatement(deleteSql);
+             PreparedStatement insertStatement = connection.prepareStatement(insertSql)) {
+            connection.setAutoCommit(false);
+            saveScopedMatchData(scopeId, scopedMessageId, extractedDataByRule, deleteStatement, insertStatement);
+            connection.commit();
+        } catch (Exception e) {
+            logDatabaseError("saveScopedMatches", e);
+        }
+    }
+
+    public synchronized int deleteScopedDataboardScope(String scopeId) {
+        if (scopeId == null || scopeId.isBlank()) {
+            return 0;
+        }
+
+        String deleteMatchSql = String.format("DELETE FROM %s WHERE scope_id = ?", SCOPED_MATCH_TABLE_NAME);
+        String deleteMessageSql = String.format("DELETE FROM %s WHERE scope_id = ?", SCOPED_MESSAGE_TABLE_NAME);
+        String deleteScopeSql = String.format("DELETE FROM %s WHERE scope_id = ?", SCOPED_SCOPE_TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement deleteMatchStatement = connection.prepareStatement(deleteMatchSql);
+             PreparedStatement deleteMessageStatement = connection.prepareStatement(deleteMessageSql);
+             PreparedStatement deleteScopeStatement = connection.prepareStatement(deleteScopeSql)) {
+            connection.setAutoCommit(false);
+            deleteMatchStatement.setString(1, scopeId);
+            deleteMatchStatement.executeUpdate();
+            deleteMessageStatement.setString(1, scopeId);
+            deleteMessageStatement.executeUpdate();
+            deleteScopeStatement.setString(1, scopeId);
+            int deletedScopes = deleteScopeStatement.executeUpdate();
+            connection.commit();
+            return deletedScopes;
+        } catch (Exception e) {
+            logDatabaseError("deleteScopedDataboardScope", e);
+            return 0;
+        }
+    }
+
+    public synchronized int deleteAllScopedDataboardScopes() {
+        String deleteMatchSql = String.format("DELETE FROM %s", SCOPED_MATCH_TABLE_NAME);
+        String deleteMessageSql = String.format("DELETE FROM %s", SCOPED_MESSAGE_TABLE_NAME);
+        String deleteScopeSql = String.format("DELETE FROM %s", SCOPED_SCOPE_TABLE_NAME);
+
+        try (Connection connection = getConnection(); Statement statement = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            statement.executeUpdate(deleteMatchSql);
+            statement.executeUpdate(deleteMessageSql);
+            int deletedScopes = statement.executeUpdate(deleteScopeSql);
+            connection.commit();
+            return deletedScopes;
+        } catch (Exception e) {
+            logDatabaseError("deleteAllScopedDataboardScopes", e);
+            return 0;
+        }
+    }
+
+    private long nextScopedMessageOrder(Connection connection, String scopeId) throws SQLException {
+        String querySql = String.format("SELECT COALESCE(MAX(scoped_order), 0) + 1 FROM %s WHERE scope_id = ?", SCOPED_MESSAGE_TABLE_NAME);
+        try (PreparedStatement statement = connection.prepareStatement(querySql)) {
+            statement.setString(1, scopeId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? resultSet.getLong(1) : 1;
+            }
+        }
+    }
+
+    private void saveScopedMatchData(String scopeId,
+                                     String scopedMessageId,
+                                     Map<String, List<String>> extractedDataByRule,
+                                     PreparedStatement deleteMatchStatement,
+                                     PreparedStatement insertMatchStatement) throws SQLException {
+        deleteMatchStatement.setString(1, scopeId);
+        deleteMatchStatement.setString(2, scopedMessageId);
+        deleteMatchStatement.executeUpdate();
+
+        if (extractedDataByRule == null || extractedDataByRule.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<String, List<String>> entry : extractedDataByRule.entrySet()) {
+            String ruleName = entry.getKey();
+            if (ruleName == null || ruleName.isBlank()) {
+                continue;
+            }
+
+            List<String> extractedValues = entry.getValue();
+            if (extractedValues == null || extractedValues.isEmpty()) {
+                continue;
+            }
+
+            for (String extractedValue : extractedValues) {
+                if (extractedValue == null || extractedValue.isBlank()) {
+                    continue;
+                }
+
+                insertMatchStatement.setString(1, scopeId);
+                insertMatchStatement.setString(2, scopedMessageId);
+                insertMatchStatement.setString(3, ruleName);
+                insertMatchStatement.setString(4, extractedValue);
                 insertMatchStatement.addBatch();
             }
         }
