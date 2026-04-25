@@ -23,8 +23,10 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 public class Datatable extends JPanel {
-    private final MontoyaApi api;
-    private final ConfigLoader configLoader;
+    public interface TableFilterListener {
+        void applyMessageFilter(String tableName, String filterText);
+    }
+
     private final JTable dataTable;
     private final DefaultTableModel dataTableModel;
     private final JTextField searchField;
@@ -39,8 +41,6 @@ public class Datatable extends JPanel {
     private boolean invalidRegexActive;
 
     public Datatable(MontoyaApi api, ConfigLoader configLoader, String tabName, List<String> dataList) {
-        this.api = api;
-        this.configLoader = configLoader;
         this.tabName = tabName;
 
         String[] columnNames = {"#", "Information"};
@@ -259,7 +259,7 @@ public class Datatable extends JPanel {
         statusLabel.setText(statusText);
     }
 
-    private void handleDoubleClick(int selectedRow, MessageTableModel messagePanel) {
+    private void handleDoubleClick(int selectedRow, TableFilterListener messagePanel) {
         if (doubleClickWorker != null && !doubleClickWorker.isDone()) {
             doubleClickWorker.cancel(true);
         }
@@ -280,6 +280,14 @@ public class Datatable extends JPanel {
     }
 
     public void setTableListener(MessageTableModel messagePanel) {
+        setTableListener((tableName, filterText) -> messagePanel.applyMessageFilter(tableName, filterText));
+    }
+
+    public void setTableListener(TableFilterListener messagePanel) {
+        if (messagePanel == null) {
+            return;
+        }
+
         // 表格复制功能
         dataTable.setTransferHandler(new TransferHandler() {
             @Override

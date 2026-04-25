@@ -11,7 +11,7 @@ public class MessageEntry {
     private final String method;
     private final String contentHash;
 
-    MessageEntry(String messageId, String method, String url, String comment, String length, String color, String status, String contentHash) {
+    public MessageEntry(String messageId, String method, String url, String comment, String length, String color, String status, String contentHash) {
         this.messageId = messageId;
         this.method = method;
         this.url = url;
