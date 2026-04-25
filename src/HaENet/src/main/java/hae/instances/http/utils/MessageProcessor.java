@@ -6,14 +6,44 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
 import hae.Config;
 import hae.utils.ConfigLoader;
+import hae.utils.string.StringProcessor;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public class MessageProcessor {
     private final MontoyaApi api;
     private final RegularMatcher regularMatcher;
+
+    public static class ProcessedMessage {
+        private final String comment;
+        private final String color;
+        private final Map<String, List<String>> extractedDataByRule;
+
+        private ProcessedMessage(String comment, String color, Map<String, List<String>> extractedDataByRule) {
+            this.comment = comment;
+            this.color = color;
+            this.extractedDataByRule = extractedDataByRule;
+        }
+
+        public String getComment() {
+            return comment;
+        }
+
+        public String getColor() {
+            return color;
+        }
+
+        public Map<String, List<String>> getExtractedDataByRule() {
+            return extractedDataByRule;
+        }
+
+        public boolean hasMatches() {
+            return comment != null && !comment.isBlank() && color != null && !color.isBlank();
+        }
+    }
 
     public MessageProcessor(MontoyaApi api, ConfigLoader configLoader) {
         this.api = api;
@@ -25,7 +55,8 @@ public class MessageProcessor {
 
         try {
             obj = regularMatcher.performRegexMatching(host, "any", message, message, message);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            logProcessingError("processMessage", e);
         }
 
         return getDataList(obj, flag);
@@ -35,14 +66,9 @@ public class MessageProcessor {
         Map<String, Map<String, Object>> obj = null;
 
         try {
-            String response = new String(httpResponse.toByteArray().getBytes(), StandardCharsets.UTF_8);
-            String body = new String(httpResponse.body().getBytes(), StandardCharsets.UTF_8);
-            String header = httpResponse.headers().stream()
-                    .map(HttpHeader::toString)
-                    .collect(Collectors.joining("\r\n"));
-
-            obj = regularMatcher.performRegexMatching(host, "response", response, header, body);
-        } catch (Exception ignored) {
+            obj = matchResponse(host, httpResponse);
+        } catch (Exception e) {
+            logProcessingError("processResponse", e);
         }
 
         return getDataList(obj, flag);
@@ -52,17 +78,117 @@ public class MessageProcessor {
         Map<String, Map<String, Object>> obj = null;
 
         try {
-            String request = new String(httpRequest.toByteArray().getBytes(), StandardCharsets.UTF_8);
-            String body = new String(httpRequest.body().getBytes(), StandardCharsets.UTF_8);
-            String header = httpRequest.headers().stream()
-                    .map(HttpHeader::toString)
-                    .collect(Collectors.joining("\r\n"));
-
-            obj = regularMatcher.performRegexMatching(host, "request", request, header, body);
-        } catch (Exception ignored) {
+            obj = matchRequest(host, httpRequest);
+        } catch (Exception e) {
+            logProcessingError("processRequest", e);
         }
 
         return getDataList(obj, flag);
+    }
+
+    public ProcessedMessage processRequestResponse(String host, HttpRequest httpRequest, HttpResponse httpResponse) {
+        List<Map<String, Map<String, Object>>> matchResults = new ArrayList<>(2);
+        matchResults.add(matchRequest(host, httpRequest, false));
+        matchResults.add(matchResponse(host, httpResponse, false));
+        return buildProcessedMessage(matchResults);
+    }
+
+    private Map<String, Map<String, Object>> matchRequest(String host, HttpRequest httpRequest) {
+        return matchRequest(host, httpRequest, true);
+    }
+
+    private Map<String, Map<String, Object>> matchRequest(String host, HttpRequest httpRequest, boolean cacheAndPersistMatches) {
+        String request = decodeBytePreserving(httpRequest.toByteArray().getBytes());
+        String body = decodeBytePreserving(httpRequest.body().getBytes());
+        String header = httpRequest.headers().stream()
+                .map(HttpHeader::toString)
+                .collect(Collectors.joining("\r\n"));
+
+        return regularMatcher.performRegexMatching(host, "request", request, header, body, cacheAndPersistMatches);
+    }
+
+    private Map<String, Map<String, Object>> matchResponse(String host, HttpResponse httpResponse) {
+        return matchResponse(host, httpResponse, true);
+    }
+
+    private Map<String, Map<String, Object>> matchResponse(String host, HttpResponse httpResponse, boolean cacheAndPersistMatches) {
+        String response = decodeBytePreserving(httpResponse.toByteArray().getBytes());
+        String body = decodeBytePreserving(httpResponse.body().getBytes());
+        String header = httpResponse.headers().stream()
+                .map(HttpHeader::toString)
+                .collect(Collectors.joining("\r\n"));
+
+        return regularMatcher.performRegexMatching(host, "response", response, header, body, cacheAndPersistMatches);
+    }
+
+    private String decodeBytePreserving(byte[] bytes) {
+        return new String(bytes, StandardCharsets.ISO_8859_1);
+    }
+
+    private ProcessedMessage buildProcessedMessage(List<Map<String, Map<String, Object>>> matchResults) {
+        List<String> colorList = new ArrayList<>();
+        List<String> commentList = new ArrayList<>();
+        Map<String, Set<String>> mergedExtractedData = new LinkedHashMap<>();
+
+        for (Map<String, Map<String, Object>> matchResult : matchResults) {
+            if (matchResult == null || matchResult.isEmpty()) {
+                continue;
+            }
+
+            extractColorsAndComments(matchResult, colorList, commentList);
+            appendExtractedData(mergedExtractedData, matchResult);
+        }
+
+        String color = colorList.isEmpty() ? "none" : retrieveFinalColor(retrieveColorIndices(colorList));
+        String comment = commentList.isEmpty() ? "" : StringProcessor.mergeComment(String.join(", ", commentList));
+        Map<String, List<String>> normalizedExtractedData = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> entry : mergedExtractedData.entrySet()) {
+            normalizedExtractedData.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+        }
+
+        return new ProcessedMessage(comment, color, normalizedExtractedData);
+    }
+
+    private void extractColorsAndComments(Map<String, Map<String, Object>> inputData, List<String> colorList, List<String> commentList) {
+        inputData.keySet().forEach(key -> {
+            Map<String, Object> tempMap = inputData.get(key);
+            Object color = tempMap.get("color");
+            if (color != null) {
+                colorList.add(color.toString());
+            }
+            commentList.add(key);
+        });
+    }
+
+    private void appendExtractedData(Map<String, Set<String>> mergedMap, Map<String, Map<String, Object>> inputData) {
+        for (Map.Entry<String, Map<String, Object>> entry : inputData.entrySet()) {
+            String ruleName = StringProcessor.extractItemName(entry.getKey());
+            if (ruleName == null || ruleName.isBlank()) {
+                continue;
+            }
+
+            Map<String, Object> dataMap = entry.getValue();
+            Object data = dataMap.get("data");
+            if (data == null || data.toString().isBlank()) {
+                continue;
+            }
+
+            Set<String> valueSet = mergedMap.computeIfAbsent(ruleName, ignored -> new LinkedHashSet<>());
+            String[] values = data.toString().split(Pattern.quote(Config.boundary));
+            for (String value : values) {
+                if (value != null) {
+                    String normalizedValue = value.trim();
+                    if (!normalizedValue.isEmpty()) {
+                        valueSet.add(normalizedValue);
+                    }
+                }
+            }
+        }
+    }
+
+    private void logProcessingError(String methodName, Exception exception) {
+        String message = exception == null ? "unknown" : exception.getMessage();
+        api.logging().logToError(methodName + ": " + message);
     }
 
     private List<Map<String, String>> getDataList(Map<String, Map<String, Object>> obj, boolean actionFlag) {

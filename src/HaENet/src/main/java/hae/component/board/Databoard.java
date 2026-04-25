@@ -1,7 +1,6 @@
 package hae.component.board;
 
 import burp.api.montoya.MontoyaApi;
-import hae.Config;
 import hae.cache.DataCache;
 import hae.component.board.message.MessageTableModel;
 import hae.component.board.message.MessageTableModel.MessageTable;
@@ -14,23 +13,19 @@ import javax.swing.*;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.table.TableColumnModel;
-import javax.swing.table.TableModel;
-import javax.swing.table.TableRowSorter;
 import java.awt.*;
 import java.awt.event.*;
 import java.text.Collator;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
 
 public class Databoard extends JPanel {
     private static Boolean isMatchHost = false;
     private final MontoyaApi api;
     private final ConfigLoader configLoader;
     private final MessageTableModel messageTableModel;
-    private final DefaultComboBoxModel comboBoxModel = new DefaultComboBoxModel();
-    private final JComboBox hostComboBox = new JComboBox(comboBoxModel);
+    private final DefaultComboBoxModel<String> comboBoxModel = new DefaultComboBoxModel<>();
+    private final JComboBox<String> hostComboBox = new JComboBox<>(comboBoxModel);
     private JTextField hostTextField;
     private JTabbedPane dataTabbedPane;
     private JSplitPane splitPane;
@@ -38,6 +33,10 @@ public class Databoard extends JPanel {
     private JProgressBar progressBar;
     private SwingWorker<Map<String, List<String>>, Integer> handleComboBoxWorker;
     private SwingWorker<Void, Void> applyHostFilterWorker;
+    private SwingWorker<List<String>, Void> hostListWorker;
+    private List<String> cachedHostList = new ArrayList<>();
+    private long cachedHostListAt = 0L;
+    private static final long HOST_LIST_CACHE_TTL_MILLIS = 3000L;
 
     public Databoard(MontoyaApi api, ConfigLoader configLoader, MessageTableModel messageTableModel) {
         this.api = api;
@@ -226,53 +225,9 @@ public class Databoard extends JPanel {
     }
 
     private Map<String, List<String>> getSelectedMapByHost(String selectedHost, DataLoadingWorker worker) {
-        ConcurrentHashMap<String, Map<String, List<String>>> dataMap = Config.globalDataMap;
-        Map<String, List<String>> selectedDataMap;
-
-        if (selectedHost.contains("*")) {
-            selectedDataMap = new HashMap<>();
-            List<String> matchingKeys = new ArrayList<>();
-
-            // 第一步：找出所有匹配的键（预处理）
-            for (String key : dataMap.keySet()) {
-                if ((StringProcessor.matchesHostPattern(key, selectedHost) || selectedHost.equals("*")) && !key.contains("*")) {
-                    matchingKeys.add(key);
-                }
-            }
-
-            // 第二步：分批处理数据
-            int totalKeys = matchingKeys.size();
-            for (int i = 0; i < totalKeys; i++) {
-                String key = matchingKeys.get(i);
-                Map<String, List<String>> ruleMap = dataMap.get(key);
-
-                if (ruleMap != null) {
-                    for (String ruleKey : ruleMap.keySet()) {
-                        List<String> dataList = ruleMap.get(ruleKey);
-                        if (selectedDataMap.containsKey(ruleKey)) {
-                            List<String> mergedList = new ArrayList<>(selectedDataMap.get(ruleKey));
-                            mergedList.addAll(dataList);
-                            // 使用HashSet去重
-                            HashSet<String> uniqueSet = new HashSet<>(mergedList);
-                            selectedDataMap.put(ruleKey, new ArrayList<>(uniqueSet));
-                        } else {
-                            selectedDataMap.put(ruleKey, new ArrayList<>(dataList));
-                        }
-                    }
-                }
-
-                // 报告进度
-                if (worker != null && i % 5 == 0) {
-                    int progress = (int) ((i + 1) * 90.0 / totalKeys);
-                    worker.publishProgress(progress);
-                }
-            }
-        } else {
-            selectedDataMap = dataMap.get(selectedHost);
-            // 对于非通配符匹配，直接返回结果
-            if (worker != null) {
-                worker.publishProgress(90);
-            }
+        Map<String, List<String>> selectedDataMap = messageTableModel.loadExtractedDataByHost(selectedHost);
+        if (worker != null) {
+            worker.publishProgress(90);
         }
 
         return selectedDataMap != null ? selectedDataMap : new HashMap<>();
@@ -284,7 +239,8 @@ public class Databoard extends JPanel {
         String input = hostTextField.getText().toLowerCase();
 
         if (!input.isEmpty()) {
-            for (String host : getHostByList()) {
+            refreshHostListAsync(false);
+            for (String host : getCachedHostList()) {
                 String lowerCaseHost = host.toLowerCase();
                 if (lowerCaseHost.contains(input)) {
                     if (lowerCaseHost.equals(input)) {
@@ -319,12 +275,47 @@ public class Databoard extends JPanel {
     }
 
     private List<String> getHostByList() {
-        List<String> result = new ArrayList<>();
-        if (!Config.globalDataMap.isEmpty()) {
-            result = new ArrayList<>(Config.globalDataMap.keySet());
+        refreshHostListAsync(true);
+        return getCachedHostList();
+    }
+
+    private List<String> getCachedHostList() {
+        synchronized (this) {
+            return new ArrayList<>(cachedHostList);
+        }
+    }
+
+    private void refreshHostListAsync(boolean force) {
+        long now = System.currentTimeMillis();
+        synchronized (this) {
+            if (!force && now - cachedHostListAt < HOST_LIST_CACHE_TTL_MILLIS) {
+                return;
+            }
+            if (hostListWorker != null && !hostListWorker.isDone()) {
+                return;
+            }
         }
 
-        return result;
+        hostListWorker = new SwingWorker<>() {
+            @Override
+            protected List<String> doInBackground() {
+                return messageTableModel.loadMatchedHosts();
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    List<String> hosts = get();
+                    synchronized (Databoard.this) {
+                        cachedHostList = hosts == null ? new ArrayList<>() : new ArrayList<>(hosts);
+                        cachedHostListAt = System.currentTimeMillis();
+                    }
+                } catch (Exception e) {
+                    api.logging().logToOutput("refreshHostListAsync: " + e.getMessage());
+                }
+            }
+        };
+        hostListWorker.execute();
     }
 
     private void clearCacheActionPerformed(ActionEvent e) {
@@ -343,35 +334,6 @@ public class Databoard extends JPanel {
             dataTabbedPane.removeAll();
             splitPane.setVisible(false);
             progressBar.setVisible(false);
-
-            Config.globalDataMap.keySet().parallelStream().forEach(key -> {
-                if (StringProcessor.matchesHostPattern(key, host) || host.equals("*")) {
-                    Config.globalDataMap.remove(key);
-                }
-            });
-
-            // 删除无用的数据
-            Set<String> wildcardKeys = Config.globalDataMap.keySet().stream()
-                    .filter(key -> key.startsWith("*."))
-                    .collect(Collectors.toSet());
-
-            Set<String> existingSuffixes = Config.globalDataMap.keySet().stream()
-                    .filter(key -> !key.startsWith("*."))
-                    .map(key -> {
-                        int dotIndex = key.indexOf(".");
-                        return dotIndex != -1 ? key.substring(dotIndex) : "";
-                    })
-                    .collect(Collectors.toSet());
-
-            Set<String> keysToRemove = wildcardKeys.stream()
-                    .filter(key -> !existingSuffixes.contains(key.substring(1)))
-                    .collect(Collectors.toSet());
-
-            keysToRemove.forEach(Config.globalDataMap::remove);
-
-            if (Config.globalDataMap.size() == 1 && Config.globalDataMap.keySet().stream().anyMatch(key -> key.equals("*"))) {
-                Config.globalDataMap.remove("*");
-            }
 
             messageTableModel.deleteByHost(host);
 
