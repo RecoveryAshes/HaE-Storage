@@ -61,22 +61,45 @@ class SqliteMessageStoreScopedSchemaTest {
     }
 
     @Test
-    void existingDatabaseMigrationAddsScopedSchemaWithoutChangingMainCounts() throws Exception {
+    void legacyMainSchemaMigrationAddsScopedTablesAndIndexesWithoutChangingMainRows() throws Exception {
         Path home = tempDirectory.resolve("existing");
         Path databasePath = haeDatabasePath(home);
         Files.createDirectories(databasePath.getParent());
         createExistingMainTables(databasePath);
 
-        assertExistingMainCounts(databasePath, 1, 1);
+        try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(databasePath))) {
+            assertAll(
+                    () -> TestFixtures.assertSqlCount(connection, MAIN_MESSAGE_TABLE, 1),
+                    () -> TestFixtures.assertSqlCount(connection, MAIN_MATCH_TABLE, 1),
+                    () -> assertSqliteObjectMissing(connection, "table", SCOPED_SCOPE_TABLE),
+                    () -> assertSqliteObjectMissing(connection, "table", SCOPED_MESSAGE_TABLE),
+                    () -> assertSqliteObjectMissing(connection, "table", SCOPED_MATCH_TABLE)
+            );
+        }
+
         StoreContext context = createStoreContext(home);
 
         try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
             assertAll(
                     () -> TestFixtures.assertSqlCount(connection, MAIN_MESSAGE_TABLE, 1),
                     () -> TestFixtures.assertSqlCount(connection, MAIN_MATCH_TABLE, 1),
+                    () -> assertEquals("https://example.test/existing", singleString(connection,
+                            "SELECT url FROM message_history WHERE message_id = ? AND content_hash = ?",
+                            "existing-main-1",
+                            "existing-content-hash")),
+                    () -> assertEquals("existing extracted value", singleString(connection,
+                            "SELECT extracted_value FROM message_match WHERE message_id = ? AND rule_name = ?",
+                            "existing-main-1",
+                            "ExistingRule")),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "regex_status"),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "request_length"),
                     () -> assertSqliteObjectExists(connection, "table", SCOPED_SCOPE_TABLE),
                     () -> assertSqliteObjectExists(connection, "table", SCOPED_MESSAGE_TABLE),
                     () -> assertSqliteObjectExists(connection, "table", SCOPED_MATCH_TABLE),
+                    () -> assertSqliteObjectExists(connection, "index", "idx_scoped_databoard_message_scope_id"),
+                    () -> assertSqliteObjectExists(connection, "index", "idx_scoped_databoard_message_scoped_message_id"),
+                    () -> assertSqliteObjectExists(connection, "index", "idx_scoped_databoard_match_scope_id"),
+                    () -> assertSqliteObjectExists(connection, "index", "idx_scoped_databoard_match_message_id"),
                     () -> assertSqliteObjectExists(connection, "index", "idx_scoped_databoard_match_scope_rule_value")
             );
         }
@@ -187,7 +210,53 @@ class SqliteMessageStoreScopedSchemaTest {
     }
 
     @Test
-    void scopedMatchRoundTripsFiftyKilobyteExtractedValueWithoutTruncation() throws Exception {
+    void task11MainMatchTruncationRegressionRoundTripsFiftyKilobyteExtractedValue() throws Exception {
+        StoreContext context = createStoreContext(tempDirectory.resolve("main-large-value"));
+        String largeValue = extractedValueOfSize("main-task11-", 50 * 1024);
+
+        context.store().saveMessage(
+                "large-main-1",
+                minimalRequestResponse(),
+                "https://large-main.example.test/path",
+                "POST",
+                "201",
+                String.valueOf(largeValue.length()),
+                "main large comment",
+                "cyan",
+                "large-main-hash",
+                Map.of("LargeMainRule", List.of(largeValue))
+        );
+
+        Map<String, List<String>> mainData = context.store().loadExtractedDataByHost("large-main.example.test");
+        List<SqliteMessageStore.MessageMetadata> filteredMetadata = context.store().loadMessageMetadataPage(
+                "large-main.example.test",
+                "",
+                "LargeMainRule",
+                largeValue,
+                10,
+                0
+        );
+        String storedValue;
+        try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
+            storedValue = singleString(connection,
+                    "SELECT extracted_value FROM message_match WHERE message_id = ? AND rule_name = ?",
+                    "large-main-1",
+                    "LargeMainRule");
+        }
+
+        assertAll(
+                () -> assertEquals(50 * 1024, largeValue.length()),
+                () -> assertEquals(largeValue.length(), storedValue.length()),
+                () -> assertEquals(largeValue, storedValue),
+                () -> assertEquals(List.of(largeValue), mainData.get("LargeMainRule")),
+                () -> assertEquals(largeValue.length(), mainData.get("LargeMainRule").get(0).length()),
+                () -> assertEquals(1, context.store().countMessageMetadata("large-main.example.test", "", "LargeMainRule", largeValue)),
+                () -> assertEquals(List.of("large-main-1"), metadataIds(filteredMetadata))
+        );
+    }
+
+    @Test
+    void task11ScopedMatchTruncationRegressionRoundTripsFiftyKilobyteExtractedValue() throws Exception {
         StoreContext context = createStoreContext(tempDirectory.resolve("large-value"));
         String scopeId = context.store().createScopedDataboardScope("large", "50kb value");
         assertNotNull(scopeId);
@@ -204,7 +273,7 @@ class SqliteMessageStoreScopedSchemaTest {
                 "orange",
                 "large-scoped-hash"
         );
-        String largeValue = "v".repeat(50 * 1024);
+        String largeValue = extractedValueOfSize("scoped-task11-", 50 * 1024);
 
         context.store().saveScopedMatches(scopeId, "large-scoped-1", Map.of("LargeRule", List.of(largeValue)));
 
@@ -506,6 +575,10 @@ class SqliteMessageStoreScopedSchemaTest {
         assertTrue(sqliteObjectExists(connection, type, name), () -> "Missing SQLite " + type + ": " + name);
     }
 
+    private static void assertSqliteObjectMissing(Connection connection, String type, String name) throws SQLException {
+        assertFalse(sqliteObjectExists(connection, type, name), () -> "Unexpected SQLite " + type + ": " + name);
+    }
+
     private static boolean sqliteObjectExists(Connection connection, String type, String name) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?")) {
             statement.setString(1, type);
@@ -514,6 +587,23 @@ class SqliteMessageStoreScopedSchemaTest {
                 return resultSet.next();
             }
         }
+    }
+
+    private static void assertSqlColumnExists(Connection connection, String tableName, String columnName) throws SQLException {
+        assertTrue(sqlColumnExists(connection, tableName, columnName),
+                () -> "Missing SQLite column: " + tableName + "." + columnName);
+    }
+
+    private static boolean sqlColumnExists(Connection connection, String tableName, String columnName) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("PRAGMA table_info(" + tableName + ")")) {
+            while (resultSet.next()) {
+                if (columnName.equalsIgnoreCase(resultSet.getString("name"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static long scopedRowCount(Connection connection, String tableName, String scopeId) throws SQLException {
@@ -533,6 +623,13 @@ class SqliteMessageStoreScopedSchemaTest {
                 return resultSet.next() ? resultSet.getString(1) : null;
             }
         }
+    }
+
+    private static String extractedValueOfSize(String prefix, int targetLength) {
+        if (prefix.length() > targetLength) {
+            throw new IllegalArgumentException("Prefix is longer than target length");
+        }
+        return prefix + "x".repeat(targetLength - prefix.length());
     }
 
     private static <T> T proxyFor(Class<T> type) {
