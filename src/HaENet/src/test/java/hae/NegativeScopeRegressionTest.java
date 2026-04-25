@@ -3,6 +3,7 @@ package hae;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.nio.file.LinkOption;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,10 +26,12 @@ class NegativeScopeRegressionTest {
 
     @Test
     void productionCodeAndResourcesExcludeOutOfScopeUpstreamFeatures() throws IOException {
+        Path productionRoot = PRODUCTION_ROOT.toAbsolutePath().normalize();
         List<String> matches;
-        try (Stream<Path> paths = Files.walk(PRODUCTION_ROOT)) {
+        try (Stream<Path> paths = Files.walk(productionRoot)) {
             matches = paths
-                    .filter(Files::isRegularFile)
+                    .filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+                    .filter(path -> path.toAbsolutePath().normalize().startsWith(productionRoot))
                     .filter(NegativeScopeRegressionTest::isScannableProductionFile)
                     .flatMap(NegativeScopeRegressionTest::forbiddenMatches)
                     .toList();

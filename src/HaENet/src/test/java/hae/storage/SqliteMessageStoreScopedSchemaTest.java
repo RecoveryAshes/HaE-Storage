@@ -92,7 +92,12 @@ class SqliteMessageStoreScopedSchemaTest {
                             "existing-main-1",
                             "ExistingRule")),
                     () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "regex_status"),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "regex_error"),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "regex_attempts"),
                     () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "request_length"),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "response_length"),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "url_parse_error"),
+                    () -> assertSqlColumnExists(connection, MAIN_MESSAGE_TABLE, "filter_reason"),
                     () -> assertSqliteObjectExists(connection, "table", SCOPED_SCOPE_TABLE),
                     () -> assertSqliteObjectExists(connection, "table", SCOPED_MESSAGE_TABLE),
                     () -> assertSqliteObjectExists(connection, "table", SCOPED_MATCH_TABLE),
@@ -290,7 +295,7 @@ class SqliteMessageStoreScopedSchemaTest {
         String storedValue;
         try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
             storedValue = singleString(connection,
-                    "SELECT extracted_value FROM scoped_databoard_match WHERE scope_id = ? AND scoped_message_id = ?",
+                    "SELECT extracted_value FROM scoped_databoard_match WHERE scope_id = ? AND scoped_message_id = ? AND rule_name = 'LargeRule'",
                     scopeId,
                     "large-scoped-1");
         }
