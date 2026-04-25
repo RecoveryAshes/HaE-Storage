@@ -1,6 +1,5 @@
 package hae;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,7 +65,7 @@ public class Config {
 
     public static Boolean proVersionStatus = true;
 
-    public static Map<String, Object[][]> globalRules = new HashMap<>();
+    public static Map<String, Object[][]> globalRules = new ConcurrentHashMap<>();
 
     public static ConcurrentHashMap<String, Map<String, List<String>>> globalDataMap = new ConcurrentHashMap<>();
 }

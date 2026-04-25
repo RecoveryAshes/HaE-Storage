@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ConfigLoader {
     private final MontoyaApi api;
@@ -113,7 +114,7 @@ public class ConfigLoader {
 
     // 获取规则配置
     public Map<String, Object[][]> getRules() {
-        Map<String, Object[][]> rules = new HashMap<>();
+        Map<String, Object[][]> rules = new ConcurrentHashMap<>();
 
         try {
             InputStream inputStream = Files.newInputStream(Paths.get(getRulesFilePath()));

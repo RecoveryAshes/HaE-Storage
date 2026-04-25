@@ -80,6 +80,10 @@ public class RegularMatcher {
     }
 
     public Map<String, Map<String, Object>> performRegexMatching(String host, String type, String message, String header, String body) {
+        return performRegexMatching(host, type, message, header, body, true);
+    }
+
+    public Map<String, Map<String, Object>> performRegexMatching(String host, String type, String message, String header, String body, boolean cacheAndPersistMatches) {
         // 删除动态响应头再进行存储
         String originalMessage = message;
         String dynamicHeader = configLoader.getDynamicHeader();
@@ -92,7 +96,7 @@ public class RegularMatcher {
         String messageIndex = HashCalculator.calculateHash((host + "|" + message).getBytes());
 
         // 从数据缓存中读取
-        Map<String, Map<String, Object>> dataCacheMap = DataCache.get(messageIndex);
+        Map<String, Map<String, Object>> dataCacheMap = cacheAndPersistMatches ? DataCache.get(messageIndex) : null;
 
         // 存在则返回
         if (dataCacheMap != null) {
@@ -101,19 +105,22 @@ public class RegularMatcher {
 
         // 最终返回的结果
         String firstLine = originalMessage.split("\\r?\\n", 2)[0];
-        Map<String, Map<String, Object>> finalMap = applyMatchingRules(host, type, originalMessage, firstLine, header, body);
+        Map<String, Map<String, Object>> finalMap = applyMatchingRules(host, type, originalMessage, firstLine, header, body, cacheAndPersistMatches);
 
         // 数据缓存写入，有可能是空值，当作匹配过的索引不再匹配
-        DataCache.put(messageIndex, finalMap);
+        if (cacheAndPersistMatches) {
+            DataCache.put(messageIndex, finalMap);
+        }
 
         return finalMap;
     }
 
-    private Map<String, Map<String, Object>> applyMatchingRules(String host, String type, String message, String firstLine, String header, String body) {
-        Map<String, Map<String, Object>> finalMap = new HashMap<>();
+    private Map<String, Map<String, Object>> applyMatchingRules(String host, String type, String message, String firstLine, String header, String body, boolean persistMatches) {
+        Map<String, Map<String, Object>> finalMap = new ConcurrentHashMap<>();
+        Map<String, List<Object[]>> rulesSnapshot = snapshotRules();
 
-        Config.globalRules.keySet().parallelStream().forEach(i -> {
-            for (Object[] objects : Config.globalRules.get(i)) {
+        rulesSnapshot.keySet().parallelStream().forEach(i -> {
+            for (Object[] objects : rulesSnapshot.get(i)) {
                 String matchContent = "";
                 // 遍历获取规则
                 List<String> result;
@@ -170,7 +177,7 @@ public class RegularMatcher {
                     }
 
                     // 去除重复内容
-                    HashSet tmpList = new HashSet(result);
+                    HashSet<String> tmpList = new HashSet<>(result);
                     result.clear();
                     result.addAll(tmpList);
 
@@ -182,13 +189,35 @@ public class RegularMatcher {
                         String nameAndSize = String.format("%s (%s)", name, result.size());
                         finalMap.put(nameAndSize, tmpMap);
 
-                        updateGlobalMatchCache(api, host, name, result, true);
+                        if (persistMatches) {
+                            updateGlobalMatchCache(api, host, name, result, true);
+                        }
                     }
                 }
             }
         });
 
         return finalMap;
+    }
+
+    private Map<String, List<Object[]>> snapshotRules() {
+        Map<String, List<Object[]>> snapshot = new LinkedHashMap<>();
+        synchronized (Config.globalRules) {
+            Config.globalRules.forEach((key, rules) -> {
+                if (rules == null) {
+                    snapshot.put(key, Collections.emptyList());
+                    return;
+                }
+                List<Object[]> ruleRows = new ArrayList<>(rules.length);
+                for (Object[] rule : rules) {
+                    if (rule != null) {
+                        ruleRows.add(rule.clone());
+                    }
+                }
+                snapshot.put(key, ruleRows);
+            });
+        }
+        return snapshot;
     }
 
     private List<String> executeRegexEngine(String f_regex, String s_regex, String content, String format, String engine, boolean sensitive) {
@@ -287,7 +316,8 @@ public class RegularMatcher {
     }
 
     private Matcher createPatternMatcher(String regex, String content, boolean sensitive) {
-        Pattern pattern = nfaPatternCache.computeIfAbsent(regex, k -> {
+        String cacheKey = regex + "\u0000" + sensitive;
+        Pattern pattern = nfaPatternCache.computeIfAbsent(cacheKey, k -> {
             int flags = sensitive ? 0 : Pattern.CASE_INSENSITIVE;
             return Pattern.compile(regex, flags);
         });
