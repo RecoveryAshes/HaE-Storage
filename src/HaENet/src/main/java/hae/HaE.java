@@ -11,6 +11,7 @@ import hae.instances.editor.RequestEditor;
 import hae.instances.editor.ResponseEditor;
 import hae.instances.editor.WebSocketEditor;
 import hae.instances.websocket.WebSocketMessageHandler;
+import hae.storage.SqliteMessageStore;
 import hae.utils.ConfigLoader;
 import hae.utils.DataManager;
 
@@ -33,7 +34,15 @@ public class HaE implements BurpExtension {
         // 配置文件加载
         ConfigLoader configLoader = new ConfigLoader(api);
 
-        MessageTableModel messageTableModel = new MessageTableModel(api, configLoader);
+        SqliteMessageStore messageStore = new SqliteMessageStore(api, configLoader);
+        MessageTableModel messageTableModel = new MessageTableModel(
+                api,
+                configLoader,
+                messageStore,
+                messageStore,
+                messageStore,
+                messageStore
+        );
 
         // 设置BurpSuite专业版状态
         Config.proVersionStatus = getBurpSuiteProStatus(api);

@@ -12,6 +12,10 @@ import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 import hae.Config;
 import hae.instances.http.utils.MessageProcessor;
+import hae.repository.ExtractedDataRepository;
+import hae.repository.MessageRepository;
+import hae.repository.RegexWorkRepository;
+import hae.repository.StorageMaintenanceRepository;
 import hae.storage.SqliteMessageStore;
 import hae.utils.ConfigLoader;
 import hae.utils.http.HttpUtils;
@@ -31,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -53,7 +58,10 @@ public class MessageTableModel extends AbstractTableModel {
 
     private final MontoyaApi api;
     private final ConfigLoader configLoader;
-    private final SqliteMessageStore messageStore;
+    private final MessageRepository messageRepository;
+    private final RegexWorkRepository regexWorkRepository;
+    private final ExtractedDataRepository extractedDataRepository;
+    private final StorageMaintenanceRepository storageMaintenanceRepository;
     private final MessageProcessor messageProcessor;
     private final HttpUtils httpUtils;
     private final MessageTable messageTable;
@@ -108,10 +116,28 @@ public class MessageTableModel extends AbstractTableModel {
         }
     }
 
-    public MessageTableModel(MontoyaApi api, ConfigLoader configLoader) {
-        this.api = api;
-        this.configLoader = configLoader;
-        this.messageStore = new SqliteMessageStore(api, configLoader);
+    public MessageTableModel(MontoyaApi api,
+                             ConfigLoader configLoader,
+                             MessageRepository messageRepository,
+                             RegexWorkRepository regexWorkRepository,
+                             ExtractedDataRepository extractedDataRepository,
+                             StorageMaintenanceRepository storageMaintenanceRepository) {
+        this(api, configLoader, messageRepository, regexWorkRepository, extractedDataRepository, storageMaintenanceRepository, true);
+    }
+
+    MessageTableModel(MontoyaApi api,
+                      ConfigLoader configLoader,
+                      MessageRepository messageRepository,
+                      RegexWorkRepository regexWorkRepository,
+                      ExtractedDataRepository extractedDataRepository,
+                      StorageMaintenanceRepository storageMaintenanceRepository,
+                      boolean startRegexWorkers) {
+        this.api = Objects.requireNonNull(api, "api");
+        this.configLoader = Objects.requireNonNull(configLoader, "configLoader");
+        this.messageRepository = Objects.requireNonNull(messageRepository, "messageRepository");
+        this.regexWorkRepository = Objects.requireNonNull(regexWorkRepository, "regexWorkRepository");
+        this.extractedDataRepository = Objects.requireNonNull(extractedDataRepository, "extractedDataRepository");
+        this.storageMaintenanceRepository = Objects.requireNonNull(storageMaintenanceRepository, "storageMaintenanceRepository");
         this.messageProcessor = new MessageProcessor(api, configLoader);
         this.httpUtils = new HttpUtils(api, configLoader);
         this.pageLog = new LinkedList<>();
@@ -144,7 +170,9 @@ public class MessageTableModel extends AbstractTableModel {
         splitPane.setRightComponent(messagePane);
 
         updatePaginationControls();
-        startRegexWorkers();
+        if (startRegexWorkers) {
+            startRegexWorkers();
+        }
     }
 
     private JPanel createPaginationPanel() {
@@ -276,11 +304,11 @@ public class MessageTableModel extends AbstractTableModel {
         pageWorker = new SwingWorker<>() {
             @Override
             protected PageQueryResult doInBackground() {
-                int count = messageStore.countMessageMetadata(hostFilter, commentFilter, messageTableFilter, messageValueFilter);
+                int count = messageRepository.countMessageMetadata(hostFilter, commentFilter, messageTableFilter, messageValueFilter);
                 int totalPages = Math.max(1, (count + requestedPageSize - 1) / requestedPageSize);
                 int safePage = Math.max(1, Math.min(requestedPage, totalPages));
                 int offset = (safePage - 1) * requestedPageSize;
-                List<SqliteMessageStore.MessageMetadata> metadata = messageStore.loadMessageMetadataPage(hostFilter, commentFilter, messageTableFilter, messageValueFilter, requestedPageSize, offset);
+                List<SqliteMessageStore.MessageMetadata> metadata = messageRepository.loadMessageMetadataPage(hostFilter, commentFilter, messageTableFilter, messageValueFilter, requestedPageSize, offset);
                 return new PageQueryResult(toMessageEntries(metadata), count, safePage);
             }
 
@@ -333,14 +361,14 @@ public class MessageTableModel extends AbstractTableModel {
             } catch (Exception e) {
                 api.logging().logToError("runRegexWorker: " + e.getMessage());
                 if (messageId != null) {
-                    messageStore.failRegexProcessing(messageId, e.getMessage());
+                    regexWorkRepository.failRegexProcessing(messageId, e.getMessage());
                 }
             }
         }
     }
 
     private void recoverPendingRegexWork() {
-        List<String> pendingIds = messageStore.loadPendingRegexMessageIds(PENDING_RECOVERY_BATCH_SIZE);
+        List<String> pendingIds = regexWorkRepository.loadPendingRegexMessageIds(PENDING_RECOVERY_BATCH_SIZE);
         for (String pendingId : pendingIds) {
             enqueueRegexMessage(pendingId);
         }
@@ -356,15 +384,23 @@ public class MessageTableModel extends AbstractTableModel {
         }
     }
 
+    int queuedRegexMessageIdCount() {
+        return queuedRegexMessageIds.size();
+    }
+
+    boolean hasQueuedRegexMessageId(String messageId) {
+        return queuedRegexMessageIds.contains(messageId);
+    }
+
     private void processRegexMessage(String messageId) {
-        if (!messageStore.markRegexProcessing(messageId)) {
+        if (!regexWorkRepository.markRegexProcessing(messageId)) {
             return;
         }
 
         try {
-            SqliteMessageStore.StoredMessage storedMessage = messageStore.loadStoredMessage(messageId);
+            SqliteMessageStore.StoredMessage storedMessage = messageRepository.loadStoredMessage(messageId);
             if (storedMessage == null || storedMessage.getRequestResponse() == null) {
-                messageStore.failRegexProcessing(messageId, "Stored message is unavailable");
+                regexWorkRepository.failRegexProcessing(messageId, "Stored message is unavailable");
                 return;
             }
 
@@ -376,15 +412,15 @@ public class MessageTableModel extends AbstractTableModel {
             );
 
             if (!processedMessage.hasMatches()) {
-                if (!messageStore.completeRegexProcessing(messageId, "", "none", Collections.emptyMap())) {
-                    messageStore.resetRegexProcessing(messageId, "Unable to mark unmatched regex processing as complete");
+                if (!regexWorkRepository.completeRegexProcessing(messageId, "", "none", Collections.emptyMap())) {
+                    regexWorkRepository.resetRegexProcessing(messageId, "Unable to mark unmatched regex processing as complete");
                     enqueueRegexMessage(messageId);
                 }
                 removePendingAnnotation(messageId);
                 return;
             }
 
-            boolean completed = messageStore.completeRegexProcessing(
+            boolean completed = regexWorkRepository.completeRegexProcessing(
                     messageId,
                     processedMessage.getComment(),
                     processedMessage.getColor(),
@@ -394,11 +430,11 @@ public class MessageTableModel extends AbstractTableModel {
                 applyPendingAnnotation(messageId, processedMessage);
                 refreshCurrentPageLater();
             } else {
-                messageStore.resetRegexProcessing(messageId, "Unable to complete regex processing");
+                regexWorkRepository.resetRegexProcessing(messageId, "Unable to complete regex processing");
                 enqueueRegexMessage(messageId);
             }
         } catch (Exception e) {
-            messageStore.failRegexProcessing(messageId, e.getMessage());
+            regexWorkRepository.failRegexProcessing(messageId, e.getMessage());
             removePendingAnnotation(messageId);
             api.logging().logToError("processRegexMessage: " + e.getMessage());
         }
@@ -581,7 +617,7 @@ public class MessageTableModel extends AbstractTableModel {
         String messageId = StringProcessor.getRandomUUID();
 
         if (flag) {
-            SqliteMessageStore.PendingMessageSaveResult saveResult = messageStore.savePendingMessage(
+            SqliteMessageStore.PendingMessageSaveResult saveResult = messageRepository.savePendingMessage(
                     messageId,
                     messageInfo,
                     requestMetadata.url,
@@ -628,7 +664,7 @@ public class MessageTableModel extends AbstractTableModel {
         currentWorker = new SwingWorker<>() {
             @Override
             protected Void doInBackground() {
-                messageStore.deleteByHostPattern(filterText);
+                storageMaintenanceRepository.deleteByHostPattern(filterText);
                 return null;
             }
 
@@ -643,7 +679,7 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     public int clearStorageHistory() {
-        int deletedCount = messageStore.deleteAllMessages();
+        int deletedCount = storageMaintenanceRepository.deleteAllMessages();
 
         resetMessageFilterState();
         regexQueue.clear();
@@ -687,7 +723,7 @@ public class MessageTableModel extends AbstractTableModel {
 
         try {
             queryVersion.incrementAndGet();
-            messageStore.deleteAllMessages();
+            storageMaintenanceRepository.deleteAllMessages();
             synchronized (pageLog) {
                 pageLog.clear();
             }
@@ -705,15 +741,15 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     public String getStoragePath() {
-        return messageStore.getDatabasePath();
+        return storageMaintenanceRepository.getDatabasePath();
     }
 
     public Map<String, List<String>> loadExtractedDataByHost(String hostPattern) {
-        return messageStore.loadExtractedDataByHost(hostPattern);
+        return extractedDataRepository.loadExtractedDataByHost(hostPattern);
     }
 
     public List<String> loadMatchedHosts() {
-        return messageStore.loadMatchedHosts();
+        return extractedDataRepository.loadMatchedHosts();
     }
 
     public void applyHostFilter(String filterText) {
@@ -848,7 +884,7 @@ public class MessageTableModel extends AbstractTableModel {
                 messageEntry = pageLog.get(selectedIndexSnapshot);
             }
 
-            HttpRequestResponse httpRequestResponse = messageStore.loadMessage(messageEntry.getMessageId());
+            HttpRequestResponse httpRequestResponse = messageRepository.loadMessage(messageEntry.getMessageId());
             if (httpRequestResponse == null) {
                 return;
             }
