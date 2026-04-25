@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 public class Datatable extends JPanel {
     private final MontoyaApi api;
@@ -31,9 +32,11 @@ public class Datatable extends JPanel {
     private final TableRowSorter<DefaultTableModel> sorter;
     private final JCheckBox searchMode = new JCheckBox("Reverse search");
     private final JCheckBox regexMode = new JCheckBox("Regex mode");
+    private final JLabel statusLabel;
     private final String tabName;
     private final JPanel footerPanel;
     private SwingWorker<Void, Void> doubleClickWorker;
+    private boolean invalidRegexActive;
 
     public Datatable(MontoyaApi api, ConfigLoader configLoader, String tabName, List<String> dataList) {
         this.api = api;
@@ -47,6 +50,7 @@ public class Datatable extends JPanel {
         this.sorter = new TableRowSorter<>(dataTableModel);
         this.searchField = new JTextField(10);
         this.secondSearchField = new JTextField(10);
+        this.statusLabel = new JLabel();
         this.footerPanel = new JPanel(new BorderLayout(0, 5));
 
         initComponents(dataList);
@@ -54,6 +58,12 @@ public class Datatable extends JPanel {
 
     private void initComponents(List<String> dataList) {
         dataTable.setRowSorter(sorter);
+        dataTable.setName("datatable.table");
+        searchField.setName("datatable.search");
+        secondSearchField.setName("datatable.secondSearch");
+        searchMode.setName("datatable.reverseSearch");
+        regexMode.setName("datatable.regexMode");
+        statusLabel.setName("datatable.status");
 
         // 设置ID排序
         sorter.setComparator(0, (Comparator<Integer>) Integer::compareTo);
@@ -123,6 +133,7 @@ public class Datatable extends JPanel {
         settingMenuPanel.add(regexMode);
         regexMode.setSelected(true);
         searchMode.addItemListener(e -> performSearch());
+        regexMode.addItemListener(e -> performSearch());
         settingMenu.add(settingMenuPanel);
 
         JButton settingsButton = new JButton("Settings");
@@ -136,9 +147,17 @@ public class Datatable extends JPanel {
 
         footerPanel.setBorder(BorderFactory.createEmptyBorder(2, 3, 5, 3));
         footerPanel.add(optionsPanel, BorderLayout.CENTER);
+        footerPanel.add(statusLabel, BorderLayout.EAST);
+
+        dataTable.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                updateStatusLabel();
+            }
+        });
 
         add(scrollPane, BorderLayout.CENTER);
         add(footerPanel, BorderLayout.SOUTH);
+        updateStatusLabel();
     }
 
     private void setMenuShow(JPopupMenu menu, JButton button) {
@@ -162,44 +181,82 @@ public class Datatable extends JPanel {
     }
 
     private void performSearch() {
+        invalidRegexActive = false;
         List<RowFilter<Object, Object>> filters = new ArrayList<>();
 
-        if (UIEnhancer.hasUserInput(searchField)) {
-            filters.add(getObjectObjectRowFilter(searchField, true));
+        if (hasSearchInput(searchField)) {
+            RowFilter<Object, Object> rowFilter = getObjectObjectRowFilter(searchField, true);
+            if (rowFilter != null) {
+                filters.add(rowFilter);
+            }
         }
 
-        if (UIEnhancer.hasUserInput(secondSearchField)) {
-            filters.add(getObjectObjectRowFilter(secondSearchField, false));
+        if (hasSearchInput(secondSearchField)) {
+            RowFilter<Object, Object> rowFilter = getObjectObjectRowFilter(secondSearchField, false);
+            if (rowFilter != null) {
+                filters.add(rowFilter);
+            }
         }
 
         sorter.setRowFilter(filters.isEmpty() ? null : RowFilter.andFilter(filters));
+        updateStatusLabel();
     }
 
     private RowFilter<Object, Object> getObjectObjectRowFilter(JTextField searchField, boolean firstFlag) {
+        String searchFieldTextText = searchField.getText().toLowerCase();
+        boolean firstFlagReturn = searchMode.isSelected() && firstFlag;
+
+        if (regexMode.isSelected()) {
+            Pattern pattern;
+            try {
+                pattern = Pattern.compile(searchFieldTextText, Pattern.CASE_INSENSITIVE);
+            } catch (PatternSyntaxException e) {
+                invalidRegexActive = true;
+                return null;
+            }
+
+            Pattern finalPattern = pattern;
+            return new RowFilter<>() {
+                public boolean include(Entry<?, ?> entry) {
+                    String entryValue = ((String) entry.getValue(1)).toLowerCase();
+                    return finalPattern.matcher(entryValue).find() != firstFlagReturn;
+                }
+            };
+        }
+
         return new RowFilter<>() {
             public boolean include(Entry<?, ?> entry) {
-                String searchFieldTextText = searchField.getText();
-                searchFieldTextText = searchFieldTextText.toLowerCase();
                 String entryValue = ((String) entry.getValue(1)).toLowerCase();
-                boolean filterReturn = searchFieldTextText.isEmpty();
-                boolean firstFlagReturn = searchMode.isSelected() && firstFlag;
-                if (regexMode.isSelected()) {
-                    Pattern pattern = null;
-                    try {
-                        pattern = Pattern.compile(searchFieldTextText, Pattern.CASE_INSENSITIVE);
-                    } catch (Exception ignored) {
-                    }
-
-                    if (pattern != null) {
-                        filterReturn = filterReturn || pattern.matcher(entryValue).find() != firstFlagReturn;
-                    }
-                } else {
-                    filterReturn = filterReturn || entryValue.contains(searchFieldTextText) != firstFlagReturn;
-                }
-
-                return filterReturn;
+                return entryValue.contains(searchFieldTextText) != firstFlagReturn;
             }
         };
+    }
+
+    private boolean hasSearchInput(JTextField field) {
+        if (field.getText().isEmpty()) {
+            return false;
+        }
+
+        if (UIEnhancer.hasUserInput(field)) {
+            return true;
+        }
+
+        Object placeholderText = field.getClientProperty("placeholderText");
+        return placeholderText != null && !field.getText().isEmpty() && !field.getText().equals(placeholderText.toString());
+    }
+
+    private void updateStatusLabel() {
+        String statusText = "Showing " + dataTable.getRowCount() + " of " + dataTableModel.getRowCount();
+        int selectedCount = dataTable.getSelectedRowCount();
+        if (selectedCount > 0) {
+            statusText += " · Selected " + selectedCount;
+        }
+
+        if (invalidRegexActive) {
+            statusText = "Invalid regex - " + statusText;
+        }
+
+        statusLabel.setText(statusText);
     }
 
     private void handleDoubleClick(int selectedRow, MessageTableModel messagePanel) {
@@ -273,5 +330,24 @@ public class Datatable extends JPanel {
     public JTable getDataTable() {
         return this.dataTable;
     }
-}
 
+    JLabel getStatusLabel() {
+        return statusLabel;
+    }
+
+    JTextField getSearchField() {
+        return searchField;
+    }
+
+    JTextField getSecondSearchField() {
+        return secondSearchField;
+    }
+
+    JCheckBox getReverseSearchCheckBox() {
+        return searchMode;
+    }
+
+    JCheckBox getRegexModeCheckBox() {
+        return regexMode;
+    }
+}
