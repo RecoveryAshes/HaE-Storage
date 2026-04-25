@@ -2,6 +2,7 @@ package hae;
 
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.Registration;
 import burp.api.montoya.core.BurpSuiteEdition;
 import burp.api.montoya.logging.Logging;
 import hae.cache.DataCache;
@@ -10,6 +11,7 @@ import hae.component.board.message.MessageTableModel;
 import hae.instances.editor.RequestEditor;
 import hae.instances.editor.ResponseEditor;
 import hae.instances.editor.WebSocketEditor;
+import hae.instances.menu.DataboardContextMenuProvider;
 import hae.instances.websocket.WebSocketMessageHandler;
 import hae.storage.SqliteMessageStore;
 import hae.utils.ConfigLoader;
@@ -18,6 +20,8 @@ import hae.utils.DataManager;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class HaE implements BurpExtension {
+    private Registration databoardContextMenuRegistration;
+
     @Override
     public void initialize(MontoyaApi api) {
         // 设置扩展名称
@@ -49,6 +53,9 @@ public class HaE implements BurpExtension {
 
         // 注册Tab页（用于查询数据）
         api.userInterface().registerSuiteTab("HaE", new Main(api, configLoader, messageTableModel));
+
+        // 注册右键菜单（用于基于选中的 HTTP 消息打开 Scoped Databoard）
+        registerDataboardContextMenu(api, configLoader, messageStore);
 
         // 注册WebSocket处理器
         api.proxy().registerWebSocketCreationHandler(proxyWebSocketCreation -> proxyWebSocketCreation.proxyWebSocket().registerProxyMessageHandler(new WebSocketMessageHandler(api, configLoader)));
@@ -93,6 +100,16 @@ public class HaE implements BurpExtension {
         } catch (Exception e) {
             logging.logToError("registerShutdownHook: " + e.getMessage());
         }
+    }
+
+    private void registerDataboardContextMenu(MontoyaApi api, ConfigLoader configLoader, SqliteMessageStore messageStore) {
+        if (databoardContextMenuRegistration != null && databoardContextMenuRegistration.isRegistered()) {
+            return;
+        }
+
+        databoardContextMenuRegistration = api.userInterface().registerContextMenuItemsProvider(
+                new DataboardContextMenuProvider(api, configLoader, messageStore)
+        );
     }
 
     private Boolean getBurpSuiteProStatus(MontoyaApi api) {
