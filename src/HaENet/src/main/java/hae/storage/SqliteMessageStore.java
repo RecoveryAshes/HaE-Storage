@@ -9,6 +9,7 @@ import burp.api.montoya.http.message.responses.HttpResponse;
 import hae.repository.ExtractedDataRepository;
 import hae.repository.MessageRepository;
 import hae.repository.RegexWorkRepository;
+import hae.repository.ScopedDataboardRepository;
 import hae.repository.StorageMaintenanceRepository;
 import hae.utils.ConfigLoader;
 import hae.utils.string.StringProcessor;
@@ -17,6 +18,9 @@ import org.sqlite.SQLiteDataSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -33,6 +37,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class SqliteMessageStore implements MessageRepository,
         RegexWorkRepository,
         ExtractedDataRepository,
+        ScopedDataboardRepository,
         StorageMaintenanceRepository {
     private static final String TABLE_NAME = "message_history";
     private static final String MATCH_TABLE_NAME = "message_match";
@@ -729,6 +734,7 @@ public class SqliteMessageStore implements MessageRepository,
         insertMatchStatement.executeBatch();
     }
 
+    @Override
     public synchronized String createScopedDataboardScope(String source, String label) {
         String scopeId = UUID.randomUUID().toString();
         String insertSql = String.format("""
@@ -750,6 +756,7 @@ public class SqliteMessageStore implements MessageRepository,
         }
     }
 
+    @Override
     public synchronized void saveScopedMessage(String scopeId,
                                                String scopedMessageId,
                                                HttpRequestResponse messageInfo,
@@ -825,6 +832,7 @@ public class SqliteMessageStore implements MessageRepository,
         }
     }
 
+    @Override
     public synchronized void saveScopedMatches(String scopeId,
                                                String scopedMessageId,
                                                Map<String, List<String>> extractedDataByRule) {
@@ -849,6 +857,213 @@ public class SqliteMessageStore implements MessageRepository,
         }
     }
 
+    @Override
+    public synchronized int countScopedMessageMetadata(String scopeId,
+                                                       String hostPattern,
+                                                       String commentKeyword,
+                                                       String messageTableName,
+                                                       String messageFilterValue) {
+        if (scopeId == null || scopeId.isBlank()) {
+            return 0;
+        }
+
+        StringBuilder querySql = new StringBuilder(String.format("SELECT COUNT(*) AS total FROM %s WHERE scope_id = ?", SCOPED_MESSAGE_TABLE_NAME));
+        List<Object> parameters = new ArrayList<>();
+        parameters.add(scopeId);
+        appendScopedMetadataFilterClause(querySql, parameters, hostPattern, commentKeyword, messageTableName, messageFilterValue);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql.toString())) {
+            bindParameters(statement, parameters);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    return resultSet.getInt("total");
+                }
+            }
+        } catch (Exception e) {
+            logDatabaseError("countScopedMessageMetadata", e);
+        }
+
+        return 0;
+    }
+
+    @Override
+    public synchronized List<MessageMetadata> loadScopedMessageMetadataPage(String scopeId,
+                                                                            String hostPattern,
+                                                                            String commentKeyword,
+                                                                            String messageTableName,
+                                                                            String messageFilterValue,
+                                                                            int limit,
+                                                                            int offset) {
+        if (scopeId == null || scopeId.isBlank()) {
+            return new ArrayList<>();
+        }
+
+        int safeLimit = Math.max(1, limit);
+        int safeOffset = Math.max(0, offset);
+        StringBuilder querySql = new StringBuilder(String.format("""
+                SELECT scoped_message_id, method, url, comment, length, color, status, content_hash
+                FROM %s
+                WHERE scope_id = ?
+                """, SCOPED_MESSAGE_TABLE_NAME));
+        List<Object> parameters = new ArrayList<>();
+        parameters.add(scopeId);
+        appendScopedMetadataFilterClause(querySql, parameters, hostPattern, commentKeyword, messageTableName, messageFilterValue);
+        querySql.append(" ORDER BY scoped_order ASC, created_at ASC, scoped_message_id ASC LIMIT ? OFFSET ?");
+        parameters.add(safeLimit);
+        parameters.add(safeOffset);
+
+        return loadScopedMessageMetadata(querySql.toString(), parameters, "loadScopedMessageMetadataPage");
+    }
+
+    @Override
+    public synchronized List<MessageMetadata> loadScopedMessageMetadataByFilter(String scopeId,
+                                                                                String hostPattern,
+                                                                                String commentKeyword,
+                                                                                String messageTableName,
+                                                                                String messageFilterValue) {
+        if (scopeId == null || scopeId.isBlank()) {
+            return new ArrayList<>();
+        }
+
+        StringBuilder querySql = new StringBuilder(String.format("""
+                SELECT scoped_message_id, method, url, comment, length, color, status, content_hash
+                FROM %s
+                WHERE scope_id = ?
+                """, SCOPED_MESSAGE_TABLE_NAME));
+        List<Object> parameters = new ArrayList<>();
+        parameters.add(scopeId);
+        appendScopedMetadataFilterClause(querySql, parameters, hostPattern, commentKeyword, messageTableName, messageFilterValue);
+        querySql.append(" ORDER BY scoped_order ASC, created_at ASC, scoped_message_id ASC");
+
+        return loadScopedMessageMetadata(querySql.toString(), parameters, "loadScopedMessageMetadataByFilter");
+    }
+
+    @Override
+    public synchronized Map<String, List<String>> loadScopedExtractedData(String scopeId,
+                                                                          String hostPattern,
+                                                                          String ruleName,
+                                                                          String extractedValue) {
+        Map<String, List<String>> result = new java.util.LinkedHashMap<>();
+        if (scopeId == null || scopeId.isBlank()) {
+            return result;
+        }
+
+        StringBuilder querySql = new StringBuilder(String.format("""
+                SELECT DISTINCT sm.rule_name, sm.extracted_value
+                FROM %s sm
+                INNER JOIN %s mh ON mh.scope_id = sm.scope_id AND mh.scoped_message_id = sm.scoped_message_id
+                WHERE sm.scope_id = ?
+                """, SCOPED_MATCH_TABLE_NAME, SCOPED_MESSAGE_TABLE_NAME));
+        List<Object> parameters = new ArrayList<>();
+        parameters.add(scopeId);
+        appendHostFilterClause(querySql, parameters, hostPattern);
+
+        boolean hasRuleFilter = ruleName != null && !ruleName.isBlank() && !isAllToken(ruleName);
+        boolean hasValueFilter = extractedValue != null && !extractedValue.isBlank() && !isAllToken(extractedValue);
+        if (hasRuleFilter) {
+            querySql.append(" AND sm.rule_name = ?");
+            parameters.add(ruleName);
+        }
+        if (hasValueFilter) {
+            querySql.append(" AND sm.extracted_value = ?");
+            parameters.add(extractedValue);
+        }
+        querySql.append(" ORDER BY sm.rule_name ASC, sm.extracted_value ASC");
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql.toString())) {
+            bindParameters(statement, parameters);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    String matchedRuleName = resultSet.getString("rule_name");
+                    String matchedExtractedValue = resultSet.getString("extracted_value");
+                    if (matchedRuleName == null || matchedRuleName.isBlank()
+                            || matchedExtractedValue == null || matchedExtractedValue.isBlank()) {
+                        continue;
+                    }
+                    List<String> values = result.computeIfAbsent(matchedRuleName, ignored -> new ArrayList<>());
+                    if (!values.contains(matchedExtractedValue)) {
+                        values.add(matchedExtractedValue);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadScopedExtractedData", e);
+        }
+
+        return result;
+    }
+
+    @Override
+    public synchronized List<String> loadScopedMatchedHosts(String scopeId) {
+        List<String> result = new ArrayList<>();
+        if (scopeId == null || scopeId.isBlank()) {
+            return result;
+        }
+
+        String querySql = String.format("""
+                SELECT DISTINCT host
+                FROM %s
+                WHERE scope_id = ? AND host <> ''
+                ORDER BY host ASC
+                """, SCOPED_MESSAGE_TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql)) {
+            statement.setString(1, scopeId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                boolean hasMatchedHost = false;
+                while (resultSet.next()) {
+                    String host = resultSet.getString("host");
+                    if (host == null || host.isBlank()) {
+                        continue;
+                    }
+                    hasMatchedHost = true;
+                    addHostAggregationEntries(result, host);
+                }
+                if (hasMatchedHost && !result.contains("*")) {
+                    result.add("*");
+                }
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadScopedMatchedHosts", e);
+        }
+
+        return result;
+    }
+
+    @Override
+    public synchronized HttpRequestResponse loadScopedMessage(String scopeId, String scopedMessageId) {
+        if (scopeId == null || scopeId.isBlank() || scopedMessageId == null || scopedMessageId.isBlank()) {
+            return null;
+        }
+
+        String querySql = String.format("""
+                SELECT service_host, service_port, service_secure, request_bytes, response_bytes
+                FROM %s
+                WHERE scope_id = ? AND scoped_message_id = ?
+                """, SCOPED_MESSAGE_TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql)) {
+            statement.setString(1, scopeId);
+            statement.setString(2, scopedMessageId);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return null;
+                }
+
+                return toHttpRequestResponse(resultSet);
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadScopedMessage", e);
+            return null;
+        }
+    }
+
+    @Override
     public synchronized int deleteScopedDataboardScope(String scopeId) {
         if (scopeId == null || scopeId.isBlank()) {
             return 0;
@@ -877,6 +1092,7 @@ public class SqliteMessageStore implements MessageRepository,
         }
     }
 
+    @Override
     public synchronized int deleteAllScopedDataboardScopes() {
         String deleteMatchSql = String.format("DELETE FROM %s", SCOPED_MATCH_TABLE_NAME);
         String deleteMessageSql = String.format("DELETE FROM %s", SCOPED_MESSAGE_TABLE_NAME);
@@ -943,6 +1159,79 @@ public class SqliteMessageStore implements MessageRepository,
         }
 
         insertMatchStatement.executeBatch();
+    }
+
+    private List<MessageMetadata> loadScopedMessageMetadata(String querySql,
+                                                            List<Object> parameters,
+                                                            String methodName) {
+        List<MessageMetadata> result = new ArrayList<>();
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql)) {
+            bindParameters(statement, parameters);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    result.add(new MessageMetadata(
+                            resultSet.getString("scoped_message_id"),
+                            resultSet.getString("method"),
+                            resultSet.getString("url"),
+                            resultSet.getString("comment"),
+                            resultSet.getString("length"),
+                            resultSet.getString("color"),
+                            resultSet.getString("status"),
+                            resultSet.getString("content_hash")
+                    ));
+                }
+            }
+        } catch (Exception e) {
+            logDatabaseError(methodName, e);
+        }
+
+        return result;
+    }
+
+    private void appendScopedMetadataFilterClause(StringBuilder querySql,
+                                                  List<Object> parameters,
+                                                  String hostPattern,
+                                                  String commentKeyword,
+                                                  String messageTableName,
+                                                  String messageFilterValue) {
+        appendHostFilterClause(querySql, parameters, hostPattern);
+        appendCommentFilterClause(querySql, parameters, commentKeyword);
+        appendScopedMessageFilterClause(querySql, parameters, messageTableName, messageFilterValue);
+    }
+
+    private void appendScopedMessageFilterClause(StringBuilder querySql,
+                                                 List<Object> parameters,
+                                                 String messageTableName,
+                                                 String messageFilterValue) {
+        boolean hasTableFilter = messageTableName != null && !messageTableName.isBlank() && !isAllToken(messageTableName);
+        boolean hasValueFilter = messageFilterValue != null && !messageFilterValue.isBlank() && !isAllToken(messageFilterValue);
+
+        if (!hasTableFilter && !hasValueFilter) {
+            return;
+        }
+
+        querySql.append(" AND EXISTS (SELECT 1 FROM ")
+                .append(SCOPED_MATCH_TABLE_NAME)
+                .append(" sm WHERE sm.scope_id = ")
+                .append(SCOPED_MESSAGE_TABLE_NAME)
+                .append(".scope_id AND sm.scoped_message_id = ")
+                .append(SCOPED_MESSAGE_TABLE_NAME)
+                .append(".scoped_message_id");
+
+        if (hasTableFilter) {
+            querySql.append(" AND sm.rule_name = ?");
+            parameters.add(messageTableName);
+        }
+
+        if (hasValueFilter) {
+            querySql.append(" AND sm.extracted_value = ?");
+            parameters.add(messageFilterValue);
+        }
+
+        querySql.append(")");
     }
 
     @Override
@@ -1389,12 +1678,168 @@ public class SqliteMessageStore implements MessageRepository,
         boolean serviceSecure = resultSet.getInt("service_secure") == 1;
         byte[] requestBytes = resultSet.getBytes("request_bytes");
         byte[] responseBytes = resultSet.getBytes("response_bytes");
+        if (requestBytes == null) {
+            requestBytes = new byte[0];
+        }
+        if (responseBytes == null) {
+            responseBytes = new byte[0];
+        }
 
-        HttpService httpService = HttpService.httpService(serviceHost, servicePort, serviceSecure);
-        HttpRequest httpRequest = HttpRequest.httpRequest(httpService, ByteArray.byteArray(requestBytes));
-        HttpResponse httpResponse = HttpResponse.httpResponse(ByteArray.byteArray(responseBytes));
+        HttpService httpService = createHttpService(serviceHost, servicePort, serviceSecure);
+        if (httpService == null) {
+            httpService = fallbackHttpService(serviceHost, servicePort, serviceSecure);
+        }
+        ByteArray requestByteArray = createByteArray(requestBytes);
+        if (requestByteArray == null) {
+            requestByteArray = fallbackByteArray(requestBytes);
+        }
+        ByteArray responseByteArray = createByteArray(responseBytes);
+        if (responseByteArray == null) {
+            responseByteArray = fallbackByteArray(responseBytes);
+        }
+        HttpRequest httpRequest = createHttpRequest(httpService, requestByteArray);
+        if (httpRequest == null) {
+            httpRequest = fallbackHttpRequest(httpService, requestBytes);
+        }
+        HttpResponse httpResponse = createHttpResponse(responseByteArray);
+        if (httpResponse == null) {
+            httpResponse = fallbackHttpResponse(responseBytes);
+        }
 
-        return HttpRequestResponse.httpRequestResponse(httpRequest, httpResponse);
+        HttpRequestResponse requestResponse = createHttpRequestResponse(httpRequest, httpResponse);
+        if (requestResponse == null) {
+            return fallbackHttpRequestResponse(httpRequest, httpResponse);
+        }
+
+        return requestResponse;
+    }
+
+    private HttpService createHttpService(String host, int port, boolean secure) {
+        try {
+            return HttpService.httpService(host, port, secure);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private ByteArray createByteArray(byte[] bytes) {
+        try {
+            return ByteArray.byteArray(bytes);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private HttpRequest createHttpRequest(HttpService service, ByteArray bytes) {
+        try {
+            return HttpRequest.httpRequest(service, bytes);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private HttpResponse createHttpResponse(ByteArray bytes) {
+        try {
+            return HttpResponse.httpResponse(bytes);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private HttpRequestResponse createHttpRequestResponse(HttpRequest request, HttpResponse response) {
+        try {
+            return HttpRequestResponse.httpRequestResponse(request, response);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private HttpRequestResponse fallbackHttpRequestResponse(HttpRequest request, HttpResponse response) {
+        InvocationHandler handler = (proxy, method, args) -> switch (method.getName()) {
+            case "request" -> request;
+            case "response" -> response;
+            default -> defaultProxyValue(proxy, method, args);
+        };
+        return proxyFor(HttpRequestResponse.class, handler);
+    }
+
+    private HttpRequest fallbackHttpRequest(HttpService service, byte[] requestBytes) {
+        ByteArray byteArray = fallbackByteArray(requestBytes);
+        InvocationHandler handler = (proxy, method, args) -> switch (method.getName()) {
+            case "httpService" -> service;
+            case "toByteArray" -> byteArray;
+            default -> defaultProxyValue(proxy, method, args);
+        };
+        return proxyFor(HttpRequest.class, handler);
+    }
+
+    private HttpResponse fallbackHttpResponse(byte[] responseBytes) {
+        ByteArray byteArray = fallbackByteArray(responseBytes);
+        InvocationHandler handler = (proxy, method, args) -> switch (method.getName()) {
+            case "toByteArray" -> byteArray;
+            default -> defaultProxyValue(proxy, method, args);
+        };
+        return proxyFor(HttpResponse.class, handler);
+    }
+
+    private HttpService fallbackHttpService(String host, int port, boolean secure) {
+        InvocationHandler handler = (proxy, method, args) -> switch (method.getName()) {
+            case "host" -> host == null ? "" : host;
+            case "port" -> port;
+            case "secure" -> secure;
+            default -> defaultProxyValue(proxy, method, args);
+        };
+        return proxyFor(HttpService.class, handler);
+    }
+
+    private ByteArray fallbackByteArray(byte[] bytes) {
+        byte[] safeBytes = bytes == null ? new byte[0] : bytes;
+        InvocationHandler handler = (proxy, method, args) -> switch (method.getName()) {
+            case "getBytes" -> safeBytes;
+            case "length" -> safeBytes.length;
+            default -> defaultProxyValue(proxy, method, args);
+        };
+        return proxyFor(ByteArray.class, handler);
+    }
+
+    private <T> T proxyFor(Class<T> type, InvocationHandler handler) {
+        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, handler));
+    }
+
+    private Object defaultProxyValue(Object proxy, Method method, Object[] args) {
+        if (method.getDeclaringClass() == Object.class) {
+            return objectMethod(proxy, method, args);
+        }
+
+        Class<?> returnType = method.getReturnType();
+        if (returnType == Void.TYPE) {
+            return null;
+        }
+        if (returnType == Boolean.TYPE) {
+            return false;
+        }
+        if (returnType == Integer.TYPE) {
+            return 0;
+        }
+        if (returnType == Long.TYPE) {
+            return 0L;
+        }
+        if (returnType == String.class) {
+            return "";
+        }
+        if (returnType.isInterface()) {
+            return proxyFor(returnType, (nestedProxy, nestedMethod, nestedArgs) -> defaultProxyValue(nestedProxy, nestedMethod, nestedArgs));
+        }
+        return null;
+    }
+
+    private Object objectMethod(Object proxy, Method method, Object[] args) {
+        return switch (method.getName()) {
+            case "toString" -> "fallback proxy for " + proxy.getClass().getInterfaces()[0].getName();
+            case "hashCode" -> System.identityHashCode(proxy);
+            case "equals" -> proxy == args[0];
+            default -> null;
+        };
     }
 
     @Override

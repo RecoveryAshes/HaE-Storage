@@ -2,13 +2,10 @@ package hae.repository;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hae.storage.SqliteMessageStore;
 
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import org.junit.jupiter.api.Test;
 
 class RepositoryContractTest {
@@ -20,6 +17,7 @@ class RepositoryContractTest {
                 () -> assertTrue(MessageRepository.class.isAssignableFrom(implementation)),
                 () -> assertTrue(RegexWorkRepository.class.isAssignableFrom(implementation)),
                 () -> assertTrue(ExtractedDataRepository.class.isAssignableFrom(implementation)),
+                () -> assertTrue(ScopedDataboardRepository.class.isAssignableFrom(implementation)),
                 () -> assertTrue(StorageMaintenanceRepository.class.isAssignableFrom(implementation))
         );
     }
@@ -61,18 +59,36 @@ class RepositoryContractTest {
                 )),
                 () -> assertDoesNotThrow(() -> RegexWorkRepository.class.getMethod("loadPendingRegexMessageIds", int.class)),
                 () -> assertDoesNotThrow(() -> ExtractedDataRepository.class.getMethod("loadExtractedDataByHost", String.class)),
+                () -> assertDoesNotThrow(() -> ScopedDataboardRepository.class.getMethod(
+                        "loadScopedMessageMetadataPage",
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        int.class,
+                        int.class
+                )),
+                () -> assertDoesNotThrow(() -> ScopedDataboardRepository.class.getMethod(
+                        "loadScopedExtractedData",
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class
+                )),
+                () -> assertDoesNotThrow(() -> ScopedDataboardRepository.class.getMethod(
+                        "loadScopedMessage",
+                        String.class,
+                        String.class
+                )),
                 () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteByHostPattern", String.class)),
                 () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteAllMessages"))
         );
     }
 
     @Test
-    void scopedRepositoryIsSignatureOnlyForFutureSqliteTables() {
+    void scopedRepositoryIsSqliteBackedContract() {
         assertTrue(ScopedDataboardRepository.class.isInterface());
-        assertFalse(ScopedDataboardRepository.class.isAssignableFrom(SqliteMessageStore.class));
-
-        for (Method method : ScopedDataboardRepository.class.getDeclaredMethods()) {
-            assertTrue(Modifier.isAbstract(method.getModifiers()), method.getName() + " should remain a signature only");
-        }
+        assertTrue(ScopedDataboardRepository.class.isAssignableFrom(SqliteMessageStore.class));
     }
 }

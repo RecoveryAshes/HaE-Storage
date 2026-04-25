@@ -1,7 +1,9 @@
 package hae.storage;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -24,6 +26,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -119,6 +122,121 @@ class SqliteMessageStoreScopedSchemaTest {
     }
 
     @Test
+    void scopedQueriesReturnOnlySelectedMessagesAndLeaveMainDataUnchanged() throws Exception {
+        StoreContext context = createStoreContext(tempDirectory.resolve("selected-query"));
+
+        saveMainMessage(context.store(), "main-1", "https://alpha.example.test/one", "alpha.example.test", "alpha-value");
+        saveMainMessage(context.store(), "main-2", "https://alpha.example.test/two", "alpha.example.test", "beta-value");
+        saveMainMessage(context.store(), "main-3", "https://beta.example.test/three", "beta.example.test", "outside-value");
+
+        String scopeId = context.store().createScopedDataboardScope("selected", "two messages");
+        assertNotNull(scopeId);
+        saveScopedMessageWithHost(context.store(), scopeId, "scoped-main-1", "alpha.example.test", "alpha-value");
+        saveScopedMessageWithHost(context.store(), scopeId, "scoped-main-2", "alpha.example.test", "beta-value");
+
+        Map<String, List<String>> scopedData = context.store().loadScopedExtractedData(scopeId, "alpha.example.test", "ScopedRule", "*");
+        List<SqliteMessageStore.MessageMetadata> scopedMetadata = context.store().loadScopedMessageMetadataPage(
+                scopeId,
+                "alpha.example.test",
+                "",
+                "ScopedRule",
+                "*",
+                10,
+                0
+        );
+        List<SqliteMessageStore.MessageMetadata> scopedAlphaOnly = context.store().loadScopedMessageMetadataPage(
+                scopeId,
+                "alpha.example.test",
+                "",
+                "ScopedRule",
+                "alpha-value",
+                10,
+                0
+        );
+        Map<String, List<String>> mainData = context.store().loadExtractedDataByHost("alpha.example.test");
+        HttpRequestResponse scopedMessage = context.store().loadScopedMessage(scopeId, "scoped-main-1");
+        byte[] expectedRequestBytes = TestFixtures.minimalHttpRequestBytes();
+        byte[] expectedResponseBytes = TestFixtures.minimalHttpResponseBytes();
+
+        assertAll(
+                () -> assertEquals(List.of("alpha-value", "beta-value"), scopedData.get("ScopedRule")),
+                () -> assertFalse(scopedData.get("ScopedRule").contains("outside-value")),
+                () -> assertEquals(2, context.store().countScopedMessageMetadata(scopeId, "alpha.example.test", "", "ScopedRule", "*")),
+                () -> assertEquals(List.of("scoped-main-1", "scoped-main-2"), metadataIds(scopedMetadata)),
+                () -> assertEquals(List.of("scoped-main-1"), metadataIds(scopedAlphaOnly)),
+                () -> assertEquals(List.of("alpha-value", "beta-value"), mainData.get("MainRule")),
+                () -> assertFalse(mainData.get("MainRule").contains("outside-value")),
+                () -> assertScopedMessageBytes(scopedMessage, expectedRequestBytes, expectedResponseBytes)
+        );
+
+        context.store().deleteAllMessages();
+        HttpRequestResponse scopedMessageAfterMainClear = context.store().loadScopedMessage(scopeId, "scoped-main-1");
+        Map<String, List<String>> scopedDataAfterMainClear = context.store().loadScopedExtractedData(scopeId, "alpha.example.test", "ScopedRule", "*");
+
+        try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
+            assertAll(
+                    () -> TestFixtures.assertSqlCount(connection, MAIN_MESSAGE_TABLE, 0),
+                    () -> TestFixtures.assertSqlCount(connection, MAIN_MATCH_TABLE, 0),
+                    () -> TestFixtures.assertSqlCount(connection, SCOPED_SCOPE_TABLE, 1),
+                    () -> TestFixtures.assertSqlCount(connection, SCOPED_MESSAGE_TABLE, 2),
+                    () -> TestFixtures.assertSqlCount(connection, SCOPED_MATCH_TABLE, 2),
+                    () -> assertScopedMessageBytes(scopedMessageAfterMainClear, expectedRequestBytes, expectedResponseBytes),
+                    () -> assertEquals(List.of("alpha-value", "beta-value"), scopedDataAfterMainClear.get("ScopedRule"))
+            );
+        }
+    }
+
+    @Test
+    void scopedMatchRoundTripsFiftyKilobyteExtractedValueWithoutTruncation() throws Exception {
+        StoreContext context = createStoreContext(tempDirectory.resolve("large-value"));
+        String scopeId = context.store().createScopedDataboardScope("large", "50kb value");
+        assertNotNull(scopeId);
+        context.store().saveScopedMessage(
+                scopeId,
+                "large-scoped-1",
+                minimalRequestResponse(),
+                "https://large.example.test/path",
+                "large.example.test",
+                "GET",
+                "200",
+                "42",
+                "large scoped comment",
+                "orange",
+                "large-scoped-hash"
+        );
+        String largeValue = "v".repeat(50 * 1024);
+
+        context.store().saveScopedMatches(scopeId, "large-scoped-1", Map.of("LargeRule", List.of(largeValue)));
+
+        Map<String, List<String>> scopedData = context.store().loadScopedExtractedData(scopeId, "large.example.test", "LargeRule", largeValue);
+        List<SqliteMessageStore.MessageMetadata> scopedMetadata = context.store().loadScopedMessageMetadataPage(
+                scopeId,
+                "large.example.test",
+                "",
+                "LargeRule",
+                largeValue,
+                10,
+                0
+        );
+        String storedValue;
+        try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
+            storedValue = singleString(connection,
+                    "SELECT extracted_value FROM scoped_databoard_match WHERE scope_id = ? AND scoped_message_id = ?",
+                    scopeId,
+                    "large-scoped-1");
+        }
+
+        assertAll(
+                () -> assertEquals(50 * 1024, largeValue.length()),
+                () -> assertEquals(largeValue.length(), storedValue.length()),
+                () -> assertEquals(largeValue, storedValue),
+                () -> assertEquals(List.of(largeValue), scopedData.get("LargeRule")),
+                () -> assertEquals(largeValue.length(), scopedData.get("LargeRule").get(0).length()),
+                () -> assertEquals(List.of("large-scoped-1"), metadataIds(scopedMetadata))
+        );
+    }
+
+    @Test
     void deleteScopedScopeRemovesOnlyThatScopeAndLeavesMainHistory() throws Exception {
         StoreContext context = createStoreContext(tempDirectory.resolve("cleanup"));
         context.store().saveMessage(
@@ -199,6 +317,68 @@ class SqliteMessageStoreScopedSchemaTest {
                 "hash-" + scopedMessageId
         );
         store.saveScopedMatches(scopeId, scopedMessageId, Map.of("ScopedRule", List.of(extractedValue)));
+    }
+
+    private static void saveMainMessage(SqliteMessageStore store,
+                                        String messageId,
+                                        String url,
+                                        String host,
+                                        String extractedValue) {
+        store.saveMessage(
+                messageId,
+                minimalRequestResponse(),
+                url,
+                "GET",
+                "200",
+                "42",
+                "main comment " + messageId,
+                "green",
+                "main-hash-" + messageId,
+                Map.of("MainRule", List.of(extractedValue))
+        );
+    }
+
+    private static void saveScopedMessageWithHost(SqliteMessageStore store,
+                                                  String scopeId,
+                                                  String scopedMessageId,
+                                                  String host,
+                                                  String extractedValue) {
+        store.saveScopedMessage(
+                scopeId,
+                scopedMessageId,
+                minimalRequestResponse(),
+                "https://" + host + "/" + scopedMessageId,
+                host,
+                "GET",
+                "200",
+                "42",
+                "scoped comment " + scopedMessageId,
+                "purple",
+                "scoped-hash-" + scopedMessageId
+        );
+        store.saveScopedMatches(scopeId, scopedMessageId, Map.of("ScopedRule", List.of(extractedValue)));
+    }
+
+    private static List<String> metadataIds(List<SqliteMessageStore.MessageMetadata> metadataRows) {
+        List<String> result = new ArrayList<>();
+        for (SqliteMessageStore.MessageMetadata metadata : metadataRows) {
+            result.add(metadata.getMessageId());
+        }
+        return result;
+    }
+
+    private static void assertScopedMessageBytes(HttpRequestResponse scopedMessage,
+                                                 byte[] expectedRequestBytes,
+                                                 byte[] expectedResponseBytes) {
+        assertNotNull(scopedMessage);
+        ByteArray requestByteArray = scopedMessage.request().toByteArray();
+        ByteArray responseByteArray = scopedMessage.response().toByteArray();
+        assertAll(
+                () -> assertEquals(expectedRequestBytes.length, requestByteArray.length()),
+                () -> assertEquals(expectedResponseBytes.length, responseByteArray.length()),
+                () -> assertArrayEquals(expectedRequestBytes, requestByteArray.getBytes()),
+                () -> assertArrayEquals(expectedResponseBytes, responseByteArray.getBytes())
+        );
     }
 
     private static HttpRequestResponse minimalRequestResponse() {

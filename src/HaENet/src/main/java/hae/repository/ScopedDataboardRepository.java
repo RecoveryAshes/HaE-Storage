@@ -7,14 +7,20 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Planned SQLite-backed repository boundary for isolated scoped Databoard data.
+ * SQLite-backed repository boundary for isolated scoped Databoard data.
  *
- * <p>This task defines signatures only. Future implementations must store scoped
- * analysis in dedicated SQLite scope/message/match tables and must not write
- * scoped results into the main {@code message_history} or {@code message_match}
- * tables. No memory-first repository, Burp extension persistence object,
- * process-local cache, or global map may become the default source of scoped
- * Databoard data.</p>
+ * <p>The SQLite scoped scope/message/match tables are the source of truth for
+ * every method in this contract. Implementations must not route scoped analysis
+ * through the main regex queue, must not write scoped results into the main
+ * {@code message_history} or {@code message_match} tables, and must not use a
+ * memory-first repository, Burp extension persistence object, process-local
+ * cache, or global map as the default source of scoped Databoard data.</p>
+ *
+ * <p>Scoped message saves must persist immutable request/response bytes or an
+ * equivalent immutable content representation so scoped results remain
+ * reproducible after the main history is cleared. UI-facing metadata queries
+ * should use SQLite filtering and pagination rather than loading an entire
+ * scope into memory.</p>
  */
 public interface ScopedDataboardRepository {
     /** Create a scoped Databoard analysis scope and return its SQLite scope id. */
