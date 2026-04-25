@@ -15,6 +15,9 @@ public interface StorageMaintenanceRepository {
     /** Delete all current message history and match rows from SQLite. */
     int deleteAllMessages();
 
+    /** Delete all scoped Databoard rows from SQLite without touching main history tables. */
+    int deleteAllScopedDataboardScopes();
+
     /** Return the concrete SQLite database path used by the backing implementation. */
     String getDatabasePath();
 }

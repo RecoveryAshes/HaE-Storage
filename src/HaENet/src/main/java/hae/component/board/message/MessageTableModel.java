@@ -680,6 +680,7 @@ public class MessageTableModel extends AbstractTableModel {
 
     public int clearStorageHistory() {
         int deletedCount = storageMaintenanceRepository.deleteAllMessages();
+        storageMaintenanceRepository.deleteAllScopedDataboardScopes();
 
         resetMessageFilterState();
         regexQueue.clear();
@@ -724,6 +725,7 @@ public class MessageTableModel extends AbstractTableModel {
         try {
             queryVersion.incrementAndGet();
             storageMaintenanceRepository.deleteAllMessages();
+            storageMaintenanceRepository.deleteAllScopedDataboardScopes();
             synchronized (pageLog) {
                 pageLog.clear();
             }

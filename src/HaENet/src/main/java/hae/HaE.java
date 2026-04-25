@@ -20,10 +20,16 @@ import hae.utils.DataManager;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class HaE implements BurpExtension {
+    private final AtomicBoolean initialized = new AtomicBoolean(false);
     private Registration databoardContextMenuRegistration;
+    private Registration unloadingHandlerRegistration;
 
     @Override
     public void initialize(MontoyaApi api) {
+        if (!initialized.compareAndSet(false, true)) {
+            return;
+        }
+
         // 设置扩展名称
         api.extension().setName("HaE-Storage - Highlighter and Extractor");
         String version = "1.0.0";
@@ -91,9 +97,19 @@ public class HaE implements BurpExtension {
                 DataCache.clear();
             } catch (Exception ignored) {
             }
+
+            try {
+                deregisterDataboardContextMenu();
+            } catch (Exception ignored) {
+            }
+
+            unloadingHandlerRegistration = null;
+            initialized.set(false);
         };
 
-        api.extension().registerUnloadingHandler(cleanupTask::run);
+        if (unloadingHandlerRegistration == null || !unloadingHandlerRegistration.isRegistered()) {
+            unloadingHandlerRegistration = api.extension().registerUnloadingHandler(cleanupTask::run);
+        }
 
         try {
             Runtime.getRuntime().addShutdownHook(new Thread(cleanupTask, "HaE-Shutdown-Cleanup"));
@@ -110,6 +126,25 @@ public class HaE implements BurpExtension {
         databoardContextMenuRegistration = api.userInterface().registerContextMenuItemsProvider(
                 new DataboardContextMenuProvider(api, configLoader, messageStore)
         );
+    }
+
+    private void deregisterDataboardContextMenu() {
+        if (databoardContextMenuRegistration == null) {
+            return;
+        }
+
+        if (databoardContextMenuRegistration.isRegistered()) {
+            databoardContextMenuRegistration.deregister();
+        }
+        databoardContextMenuRegistration = null;
+    }
+
+    void registerDataboardContextMenuForTest(MontoyaApi api, ConfigLoader configLoader, SqliteMessageStore messageStore) {
+        registerDataboardContextMenu(api, configLoader, messageStore);
+    }
+
+    void cleanupRegistrationsForTest() {
+        deregisterDataboardContextMenu();
     }
 
     private Boolean getBurpSuiteProStatus(MontoyaApi api) {

@@ -27,12 +27,18 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.util.List;
+import java.util.Map;
 import javax.swing.JPanel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class MessageTableModelRepositoryTest {
     private static final String MESSAGE_HISTORY_TABLE = "message_history";
+    private static final String MESSAGE_MATCH_TABLE = "message_match";
+    private static final String SCOPED_SCOPE_TABLE = "scoped_databoard_scope";
+    private static final String SCOPED_MESSAGE_TABLE = "scoped_databoard_message";
+    private static final String SCOPED_MATCH_TABLE = "scoped_databoard_match";
 
     @TempDir
     Path tempDirectory;
@@ -78,6 +84,68 @@ class MessageTableModelRepositoryTest {
                     () -> TestFixtures.assertSqlCount(context.databasePath(), MESSAGE_HISTORY_TABLE, 0),
                     () -> assertEquals(0, model.queuedRegexMessageIdCount())
             );
+        } finally {
+            model.clearAllDataOnShutdown();
+        }
+    }
+
+    @Test
+    void clearStorageHistoryDeletesMainAndScopedSqliteRows() throws Exception {
+        ModelContext context = createModelContext(tempDirectory.resolve("clear-storage"));
+        SqliteMessageStore store = context.store();
+        MessageTableModel model = newTestModel(context);
+        try {
+            store.saveMessage(
+                    "main-clear-1",
+                    httpRequestResponse("clear.example", "/main?token=abc", 200),
+                    "https://clear.example/main?token=abc",
+                    "GET",
+                    "200",
+                    "42",
+                    "main comment",
+                    "yellow",
+                    "main-hash-clear-1",
+                    Map.of("MainRule", List.of("main-value"))
+            );
+            String scopeId = store.createScopedDataboardScope("task-10", "clear scoped rows");
+            store.saveScopedMessage(
+                    scopeId,
+                    "scoped-clear-1",
+                    httpRequestResponse("scoped.example", "/scoped?token=def", 200),
+                    "https://scoped.example/scoped?token=def",
+                    "scoped.example",
+                    "GET",
+                    "200",
+                    "42",
+                    "scoped comment",
+                    "blue",
+                    "scoped-hash-clear-1"
+            );
+            store.saveScopedMatches(scopeId, "scoped-clear-1", Map.of("ScopedRule", List.of("scoped-value")));
+
+            try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
+                assertAll(
+                        () -> TestFixtures.assertSqlCount(connection, MESSAGE_HISTORY_TABLE, 1),
+                        () -> TestFixtures.assertSqlCount(connection, MESSAGE_MATCH_TABLE, 1),
+                        () -> TestFixtures.assertSqlCount(connection, SCOPED_SCOPE_TABLE, 1),
+                        () -> TestFixtures.assertSqlCount(connection, SCOPED_MESSAGE_TABLE, 1),
+                        () -> TestFixtures.assertSqlCount(connection, SCOPED_MATCH_TABLE, 1)
+                );
+            }
+
+            int deletedMainRows = model.clearStorageHistory();
+
+            try (Connection connection = DriverManager.getConnection(TestFixtures.sqliteJdbcUrl(context.databasePath()))) {
+                assertAll(
+                        () -> assertEquals(1, deletedMainRows),
+                        () -> TestFixtures.assertSqlCount(connection, MESSAGE_HISTORY_TABLE, 0),
+                        () -> TestFixtures.assertSqlCount(connection, MESSAGE_MATCH_TABLE, 0),
+                        () -> TestFixtures.assertSqlCount(connection, SCOPED_SCOPE_TABLE, 0),
+                        () -> TestFixtures.assertSqlCount(connection, SCOPED_MESSAGE_TABLE, 0),
+                        () -> TestFixtures.assertSqlCount(connection, SCOPED_MATCH_TABLE, 0),
+                        () -> assertEquals(0, model.queuedRegexMessageIdCount())
+                );
+            }
         } finally {
             model.clearAllDataOnShutdown();
         }

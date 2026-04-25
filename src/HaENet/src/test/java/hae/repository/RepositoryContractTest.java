@@ -82,7 +82,8 @@ class RepositoryContractTest {
                         String.class
                 )),
                 () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteByHostPattern", String.class)),
-                () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteAllMessages"))
+                () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteAllMessages")),
+                () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteAllScopedDataboardScopes"))
         );
     }
 
