@@ -1,6 +1,7 @@
 package hae.utils.http;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -20,40 +21,92 @@ public class HttpUtils {
     }
 
     public boolean verifyHttpRequestResponse(HttpRequestResponse requestResponse, String toolType) {
+        return !getFilterReason(requestResponse, toolType).isBlank();
+    }
+
+    public String getFilterReason(HttpRequestResponse requestResponse, String toolType) {
         HttpRequest request = requestResponse.request();
         HttpResponse response = requestResponse.response();
-        boolean retStatus = false;
+        StringBuilder reason = new StringBuilder();
         try {
-            String host = StringProcessor.getHostByUrl(request.url());
+            String host = getSafeHost(request);
 
             boolean isBlockHost = false;
             String blockHost = configLoader.getBlockHost();
             if (!blockHost.isBlank()) {
                 String[] hostList = configLoader.getBlockHost().split("\\|");
                 isBlockHost = isBlockHost(hostList, host);
+                appendReason(reason, isBlockHost, "BlockHost");
             }
 
             boolean isExcludeSuffix = false;
             String suffix = configLoader.getExcludeSuffix();
             if (!suffix.isBlank()) {
                 List<String> suffixList = Arrays.asList(configLoader.getExcludeSuffix().split("\\|"));
-                isExcludeSuffix = suffixList.contains(request.fileExtension().toLowerCase());
+                isExcludeSuffix = suffixList.contains(getSafeFileExtension(request));
+                appendReason(reason, isExcludeSuffix, "ExcludeSuffix");
             }
 
             boolean isToolScope = !configLoader.getScope().contains(toolType);
+            appendReason(reason, isToolScope, "HaEScope");
 
             boolean isExcludeStatus = false;
             String status = configLoader.getExcludeStatus();
             if (!status.isBlank()) {
                 List<String> statusList = Arrays.asList(configLoader.getExcludeStatus().split("\\|"));
-                isExcludeStatus = statusList.contains(String.valueOf(response.statusCode()));
+                isExcludeStatus = statusList.contains(getSafeStatus(response));
+                appendReason(reason, isExcludeStatus, "ExcludeStatus");
             }
-
-            retStatus = isExcludeSuffix || isBlockHost || isToolScope || isExcludeStatus;
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            api.logging().logToError("getFilterReason: " + e.getMessage());
         }
 
-        return retStatus;
+        return reason.toString();
+    }
+
+    private void appendReason(StringBuilder reason, boolean matched, String reasonName) {
+        if (!matched) {
+            return;
+        }
+        if (!reason.isEmpty()) {
+            reason.append(",");
+        }
+        reason.append(reasonName);
+    }
+
+    private String getSafeHost(HttpRequest request) {
+        try {
+            String host = StringProcessor.getHostByUrl(request.url());
+            if (host != null && !host.isBlank()) {
+                return host;
+            }
+        } catch (Exception e) {
+            return getServiceHost(request);
+        }
+
+        return getServiceHost(request);
+    }
+
+    private String getServiceHost(HttpRequest request) {
+        HttpService service = request.httpService();
+        return service == null ? "" : service.host();
+    }
+
+    private String getSafeFileExtension(HttpRequest request) {
+        try {
+            String fileExtension = request.fileExtension();
+            return fileExtension == null ? "" : fileExtension.toLowerCase();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String getSafeStatus(HttpResponse response) {
+        try {
+            return String.valueOf(response.statusCode());
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private boolean isBlockHost(String[] hostList, String host) {
