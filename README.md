@@ -31,6 +31,9 @@
 - 适配新版本 Gradle 构建链路。
 - 已验证可打包为 Burp 可加载 Jar。
 
+### 7) 上游功能迁移边界
+- 迁移采用 SQLite scoped tables 与仓储接口重构，并补充 JUnit 回归测试；未引入 Validator/Severity、外部命令执行或内存优先存储。
+
 ---
 
 ## 使用方式
