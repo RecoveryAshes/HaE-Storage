@@ -13,6 +13,7 @@ import org.sqlite.SQLiteDataSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -27,6 +28,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class SqliteMessageStore {
     private static final String TABLE_NAME = "message_history";
     private static final String MATCH_TABLE_NAME = "message_match";
+    private static final String REGEX_STATUS_PENDING = "PENDING";
+    private static final String REGEX_STATUS_PROCESSING = "PROCESSING";
+    private static final String REGEX_STATUS_DONE = "DONE";
+    private static final String REGEX_STATUS_FAILED = "FAILED";
+    private static final int MAX_REGEX_ATTEMPTS = 3;
+    private static final int MAX_REGEX_ERROR_LENGTH = 1000;
 
     private final MontoyaApi api;
     private final String jdbcUrl;
@@ -98,6 +105,54 @@ public class SqliteMessageStore {
         }
     }
 
+    public static class StoredMessage {
+        private final String messageId;
+        private final String host;
+        private final HttpRequestResponse requestResponse;
+
+        private StoredMessage(String messageId, String host, HttpRequestResponse requestResponse) {
+            this.messageId = messageId;
+            this.host = host;
+            this.requestResponse = requestResponse;
+        }
+
+        public String getMessageId() {
+            return messageId;
+        }
+
+        public String getHost() {
+            return host;
+        }
+
+        public HttpRequestResponse getRequestResponse() {
+            return requestResponse;
+        }
+    }
+
+    public static class PendingMessageSaveResult {
+        private final String messageId;
+        private final boolean saved;
+        private final boolean duplicate;
+
+        private PendingMessageSaveResult(String messageId, boolean saved, boolean duplicate) {
+            this.messageId = messageId;
+            this.saved = saved;
+            this.duplicate = duplicate;
+        }
+
+        public String getMessageId() {
+            return messageId;
+        }
+
+        public boolean isSaved() {
+            return saved;
+        }
+
+        public boolean isDuplicate() {
+            return duplicate;
+        }
+    }
+
     private Path resolveDatabasePath(ConfigLoader configLoader) {
         try {
             Path rulesPath = Paths.get(configLoader.getRulesFilePath());
@@ -163,7 +218,14 @@ public class SqliteMessageStore {
                     service_port INTEGER NOT NULL,
                     service_secure INTEGER NOT NULL,
                     request_bytes BLOB NOT NULL,
-                    response_bytes BLOB NOT NULL
+                    response_bytes BLOB NOT NULL,
+                    regex_status TEXT NOT NULL DEFAULT 'PENDING',
+                    regex_error TEXT NOT NULL DEFAULT '',
+                    regex_attempts INTEGER NOT NULL DEFAULT 0,
+                    request_length INTEGER NOT NULL DEFAULT 0,
+                    response_length INTEGER NOT NULL DEFAULT 0,
+                    url_parse_error TEXT NOT NULL DEFAULT '',
+                    filter_reason TEXT NOT NULL DEFAULT ''
                 )
                 """, TABLE_NAME);
 
@@ -179,6 +241,7 @@ public class SqliteMessageStore {
         String createCreatedAtIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %s(created_at)", TABLE_NAME, TABLE_NAME);
         String createHostIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_host ON %s(host)", TABLE_NAME, TABLE_NAME);
         String createHashIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_hash ON %s(content_hash)", TABLE_NAME, TABLE_NAME);
+        String createRegexStatusIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_regex_status ON %s(regex_status, created_at)", TABLE_NAME, TABLE_NAME);
         String createMatchMessageIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_message_id ON %s(message_id)", MATCH_TABLE_NAME, MATCH_TABLE_NAME);
         String createMatchRuleValueIndex = String.format("CREATE INDEX IF NOT EXISTS idx_%s_rule_value ON %s(rule_name, extracted_value)", MATCH_TABLE_NAME, MATCH_TABLE_NAME);
 
@@ -187,13 +250,162 @@ public class SqliteMessageStore {
             statement.execute("PRAGMA synchronous=NORMAL");
             statement.execute(createTableSql);
             statement.execute(createMatchTableSql);
+            migrateMessageHistorySchema(connection);
+            promoteMigratedMatchedRows(connection);
+            resetInterruptedRegexWork(connection);
             statement.execute(createCreatedAtIndex);
             statement.execute(createHostIndex);
             statement.execute(createHashIndex);
+            statement.execute(createRegexStatusIndex);
             statement.execute(createMatchMessageIndex);
             statement.execute(createMatchRuleValueIndex);
         } catch (Exception e) {
             logDatabaseError("initializeDatabase", e);
+        }
+    }
+
+    private void promoteMigratedMatchedRows(Connection connection) throws SQLException {
+        String updateSql = String.format("""
+                UPDATE %s
+                SET regex_status = ?
+                WHERE regex_status = ?
+                  AND comment <> ''
+                  AND EXISTS (SELECT 1 FROM %s mm WHERE mm.message_id = %s.message_id)
+                """, TABLE_NAME, MATCH_TABLE_NAME, TABLE_NAME);
+        try (PreparedStatement statement = connection.prepareStatement(updateSql)) {
+            statement.setString(1, REGEX_STATUS_DONE);
+            statement.setString(2, REGEX_STATUS_PENDING);
+            statement.executeUpdate();
+        }
+    }
+
+    private void resetInterruptedRegexWork(Connection connection) throws SQLException {
+        String updateSql = String.format("UPDATE %s SET regex_status = ? WHERE regex_status = ?", TABLE_NAME);
+        try (PreparedStatement statement = connection.prepareStatement(updateSql)) {
+            statement.setString(1, REGEX_STATUS_PENDING);
+            statement.setString(2, REGEX_STATUS_PROCESSING);
+            statement.executeUpdate();
+        }
+    }
+
+    private void migrateMessageHistorySchema(Connection connection) throws SQLException {
+        addColumnIfMissing(connection, TABLE_NAME, "regex_status", "TEXT NOT NULL DEFAULT 'PENDING'");
+        addColumnIfMissing(connection, TABLE_NAME, "regex_error", "TEXT NOT NULL DEFAULT ''");
+        addColumnIfMissing(connection, TABLE_NAME, "regex_attempts", "INTEGER NOT NULL DEFAULT 0");
+        addColumnIfMissing(connection, TABLE_NAME, "request_length", "INTEGER NOT NULL DEFAULT 0");
+        addColumnIfMissing(connection, TABLE_NAME, "response_length", "INTEGER NOT NULL DEFAULT 0");
+        addColumnIfMissing(connection, TABLE_NAME, "url_parse_error", "TEXT NOT NULL DEFAULT ''");
+        addColumnIfMissing(connection, TABLE_NAME, "filter_reason", "TEXT NOT NULL DEFAULT ''");
+    }
+
+    private void addColumnIfMissing(Connection connection, String tableName, String columnName, String columnDefinition) throws SQLException {
+        if (columnExists(connection, tableName, columnName)) {
+            return;
+        }
+
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(String.format("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, columnDefinition));
+        }
+    }
+
+    private boolean columnExists(Connection connection, String tableName, String columnName) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("PRAGMA table_info(" + tableName + ")")) {
+            while (resultSet.next()) {
+                if (columnName.equalsIgnoreCase(resultSet.getString("name"))) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public synchronized PendingMessageSaveResult savePendingMessage(String messageId,
+                                                                    HttpRequestResponse messageInfo,
+                                                                    String url,
+                                                                    String host,
+                                                                    String method,
+                                                                    String status,
+                                                                    String length,
+                                                                    String contentHash,
+                                                                    String urlParseError,
+                                                                    String filterReason,
+                                                                    boolean deduplicate) {
+        if (messageInfo == null) {
+            return new PendingMessageSaveResult(messageId, false, false);
+        }
+
+        try {
+            HttpRequest request = messageInfo.request();
+            HttpResponse response = messageInfo.response();
+            if (request == null || response == null) {
+                return new PendingMessageSaveResult(messageId, false, false);
+            }
+
+            HttpService service = request.httpService();
+            if (service == null) {
+                return new PendingMessageSaveResult(messageId, false, false);
+            }
+
+            byte[] requestBytes = request.toByteArray().getBytes();
+            byte[] responseBytes = response.toByteArray().getBytes();
+            String safeContentHash = contentHash;
+            if (safeContentHash == null || safeContentHash.isBlank()) {
+                safeContentHash = calculateContentHash(requestBytes, responseBytes);
+            }
+
+            if (deduplicate && existsDuplicateContent(safeContentHash)) {
+                return new PendingMessageSaveResult(messageId, false, true);
+            }
+
+            String safeHost = host;
+            if (safeHost == null || safeHost.isBlank()) {
+                safeHost = service.host();
+            }
+
+            int requestLength = requestBytes.length;
+            int responseLength = responseBytes.length;
+            String safeLength = (length == null || length.isBlank()) ? String.valueOf(responseLength) : length;
+
+            String insertSql = String.format("""
+                    INSERT INTO %s (
+                        message_id, created_at, host, url, method, status, length, comment, color, content_hash,
+                        service_host, service_port, service_secure, request_bytes, response_bytes,
+                        regex_status, regex_error, regex_attempts, request_length, response_length, url_parse_error, filter_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, TABLE_NAME);
+
+            try (Connection connection = getConnection();
+                 PreparedStatement statement = connection.prepareStatement(insertSql)) {
+                statement.setString(1, messageId);
+                statement.setLong(2, System.currentTimeMillis());
+                statement.setString(3, safeHost == null ? "" : safeHost);
+                statement.setString(4, url == null ? "" : url);
+                statement.setString(5, method == null ? "" : method);
+                statement.setString(6, status == null ? "" : status);
+                statement.setString(7, safeLength);
+                statement.setString(8, "");
+                statement.setString(9, "none");
+                statement.setString(10, safeContentHash == null ? "" : safeContentHash);
+                statement.setString(11, service.host());
+                statement.setInt(12, service.port());
+                statement.setInt(13, service.secure() ? 1 : 0);
+                statement.setBytes(14, requestBytes);
+                statement.setBytes(15, responseBytes);
+                statement.setString(16, REGEX_STATUS_PENDING);
+                statement.setString(17, "");
+                statement.setInt(18, 0);
+                statement.setInt(19, requestLength);
+                statement.setInt(20, responseLength);
+                statement.setString(21, truncateError(urlParseError));
+                statement.setString(22, filterReason == null ? "" : filterReason);
+                statement.executeUpdate();
+                return new PendingMessageSaveResult(messageId, true, false);
+            }
+        } catch (Exception e) {
+            logDatabaseError("savePendingMessage", e);
+            return new PendingMessageSaveResult(messageId, false, false);
         }
     }
 
@@ -234,8 +446,9 @@ public class SqliteMessageStore {
             String insertSql = String.format("""
                     INSERT INTO %s (
                         message_id, created_at, host, url, method, status, length, comment, color, content_hash,
-                        service_host, service_port, service_secure, request_bytes, response_bytes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        service_host, service_port, service_secure, request_bytes, response_bytes,
+                        regex_status, regex_error, regex_attempts, request_length, response_length, url_parse_error, filter_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, TABLE_NAME);
 
             try (Connection connection = getConnection();
@@ -260,6 +473,13 @@ public class SqliteMessageStore {
                 statement.setInt(13, service.secure() ? 1 : 0);
                 statement.setBytes(14, requestBytes);
                 statement.setBytes(15, responseBytes);
+                statement.setString(16, REGEX_STATUS_DONE);
+                statement.setString(17, "");
+                statement.setInt(18, 0);
+                statement.setInt(19, requestBytes.length);
+                statement.setInt(20, responseBytes.length);
+                statement.setString(21, "");
+                statement.setString(22, "");
                 statement.executeUpdate();
 
                 saveMatchData(messageId, extractedDataByRule, deleteMatchStatement, insertMatchStatement);
@@ -271,6 +491,130 @@ public class SqliteMessageStore {
         } catch (Exception e) {
             logDatabaseError("saveMessage", e);
         }
+    }
+
+    public synchronized boolean markRegexProcessing(String messageId) {
+        String updateSql = String.format("""
+                UPDATE %s
+                SET regex_status = ?, regex_attempts = regex_attempts + 1, regex_error = ''
+                WHERE message_id = ? AND (regex_status = ? OR (regex_status = ? AND regex_attempts < ?))
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(updateSql)) {
+            statement.setString(1, REGEX_STATUS_PROCESSING);
+            statement.setString(2, messageId);
+            statement.setString(3, REGEX_STATUS_PENDING);
+            statement.setString(4, REGEX_STATUS_FAILED);
+            statement.setInt(5, MAX_REGEX_ATTEMPTS);
+            return statement.executeUpdate() > 0;
+        } catch (Exception e) {
+            logDatabaseError("markRegexProcessing", e);
+            return false;
+        }
+    }
+
+    public synchronized boolean completeRegexProcessing(String messageId,
+                                                        String comment,
+                                                        String color,
+                                                        Map<String, List<String>> extractedDataByRule) {
+        String updateSql = String.format("""
+                UPDATE %s
+                SET regex_status = ?, regex_error = '', comment = ?, color = ?
+                WHERE message_id = ?
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement updateStatement = connection.prepareStatement(updateSql);
+             PreparedStatement deleteMatchStatement = connection.prepareStatement(String.format("DELETE FROM %s WHERE message_id = ?", MATCH_TABLE_NAME));
+             PreparedStatement insertMatchStatement = connection.prepareStatement(String.format("INSERT INTO %s (message_id, rule_name, extracted_value) VALUES (?, ?, ?)", MATCH_TABLE_NAME))) {
+
+            connection.setAutoCommit(false);
+            updateStatement.setString(1, REGEX_STATUS_DONE);
+            updateStatement.setString(2, comment == null ? "" : comment);
+            updateStatement.setString(3, color == null || color.isBlank() ? "none" : color);
+            updateStatement.setString(4, messageId);
+            if (updateStatement.executeUpdate() == 0) {
+                connection.rollback();
+                return false;
+            }
+
+            saveMatchData(messageId, extractedDataByRule, deleteMatchStatement, insertMatchStatement);
+
+            connection.commit();
+            return true;
+        } catch (Exception e) {
+            logDatabaseError("completeRegexProcessing", e);
+            return false;
+        }
+    }
+
+    public synchronized boolean failRegexProcessing(String messageId, String errorMessage) {
+        String updateSql = String.format("""
+                UPDATE %s
+                SET regex_status = ?, regex_error = ?
+                WHERE message_id = ?
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(updateSql)) {
+            statement.setString(1, REGEX_STATUS_FAILED);
+            statement.setString(2, truncateError(errorMessage));
+            statement.setString(3, messageId);
+            return statement.executeUpdate() > 0;
+        } catch (Exception e) {
+            logDatabaseError("failRegexProcessing", e);
+            return false;
+        }
+    }
+
+    public synchronized boolean resetRegexProcessing(String messageId, String errorMessage) {
+        String updateSql = String.format("""
+                UPDATE %s
+                SET regex_status = ?, regex_error = ?
+                WHERE message_id = ?
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(updateSql)) {
+            statement.setString(1, REGEX_STATUS_PENDING);
+            statement.setString(2, truncateError(errorMessage));
+            statement.setString(3, messageId);
+            return statement.executeUpdate() > 0;
+        } catch (Exception e) {
+            logDatabaseError("resetRegexProcessing", e);
+            return false;
+        }
+    }
+
+    public synchronized List<String> loadPendingRegexMessageIds(int limit) {
+        int safeLimit = Math.max(1, limit);
+        List<String> result = new ArrayList<>();
+        String querySql = String.format("""
+                SELECT message_id
+                FROM %s
+                WHERE regex_status = ? OR (regex_status = ? AND regex_attempts < ?)
+                ORDER BY created_at ASC, message_id ASC
+                LIMIT ?
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql)) {
+            statement.setString(1, REGEX_STATUS_PENDING);
+            statement.setString(2, REGEX_STATUS_FAILED);
+            statement.setInt(3, MAX_REGEX_ATTEMPTS);
+            statement.setInt(4, safeLimit);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    result.add(resultSet.getString("message_id"));
+                }
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadPendingRegexMessageIds", e);
+        }
+
+        return result;
     }
 
     private void saveMatchData(String messageId,
@@ -315,6 +659,7 @@ public class SqliteMessageStore {
         String querySql = String.format("""
                 SELECT message_id, method, url, comment, length, color, status, content_hash
                 FROM %s
+                WHERE regex_status = 'DONE' AND comment <> ''
                 ORDER BY created_at ASC
                 """, TABLE_NAME);
 
@@ -365,12 +710,37 @@ public class SqliteMessageStore {
         }
     }
 
+    public synchronized boolean existsDuplicateContent(String contentHash) {
+        if (contentHash == null || contentHash.isBlank()) {
+            return false;
+        }
+
+        String querySql = String.format("""
+                SELECT 1
+                FROM %s
+                WHERE content_hash = ?
+                LIMIT 1
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql)) {
+            statement.setString(1, contentHash);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next();
+            }
+        } catch (Exception e) {
+            logDatabaseError("existsDuplicateContent", e);
+            return false;
+        }
+    }
+
     public synchronized int countMessageMetadata(String hostPattern, String commentKeyword) {
         return countMessageMetadata(hostPattern, commentKeyword, "", "");
     }
 
     public synchronized int countMessageMetadata(String hostPattern, String commentKeyword, String messageTableName, String messageFilterValue) {
-        StringBuilder querySql = new StringBuilder(String.format("SELECT COUNT(*) AS total FROM %s WHERE 1=1", TABLE_NAME));
+        StringBuilder querySql = new StringBuilder(String.format("SELECT COUNT(*) AS total FROM %s WHERE regex_status = 'DONE' AND comment <> ''", TABLE_NAME));
         List<Object> parameters = new ArrayList<>();
         appendFilterClause(querySql, parameters, hostPattern, commentKeyword, messageTableName, messageFilterValue);
 
@@ -405,7 +775,7 @@ public class SqliteMessageStore {
         StringBuilder querySql = new StringBuilder(String.format("""
                 SELECT message_id, method, url, comment, length, color, status, content_hash
                 FROM %s
-                WHERE 1=1
+                WHERE regex_status = 'DONE' AND comment <> ''
                 """, TABLE_NAME));
         List<Object> parameters = new ArrayList<>();
         appendFilterClause(querySql, parameters, hostPattern, commentKeyword, messageTableName, messageFilterValue);
@@ -451,7 +821,7 @@ public class SqliteMessageStore {
         StringBuilder querySql = new StringBuilder(String.format("""
                 SELECT message_id, method, url, comment, length, color, status, content_hash
                 FROM %s
-                WHERE 1=1
+                WHERE regex_status = 'DONE' AND comment <> ''
                 """, TABLE_NAME));
 
         List<Object> parameters = new ArrayList<>();
@@ -482,6 +852,93 @@ public class SqliteMessageStore {
         }
 
         return result;
+    }
+
+    public synchronized Map<String, List<String>> loadExtractedDataByHost(String hostPattern) {
+        Map<String, List<String>> result = new java.util.LinkedHashMap<>();
+        StringBuilder querySql = new StringBuilder(String.format("""
+                SELECT mm.rule_name, mm.extracted_value
+                FROM %s mm
+                INNER JOIN %s mh ON mh.message_id = mm.message_id
+                WHERE mh.regex_status = 'DONE'
+                """, MATCH_TABLE_NAME, TABLE_NAME));
+        List<Object> parameters = new ArrayList<>();
+        appendHostFilterClause(querySql, parameters, hostPattern);
+        querySql.append(" ORDER BY mm.rule_name ASC, mm.extracted_value ASC");
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql.toString())) {
+            bindParameters(statement, parameters);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    String ruleName = resultSet.getString("rule_name");
+                    String extractedValue = resultSet.getString("extracted_value");
+                    if (ruleName == null || ruleName.isBlank() || extractedValue == null || extractedValue.isBlank()) {
+                        continue;
+                    }
+                    List<String> values = result.computeIfAbsent(ruleName, ignored -> new ArrayList<>());
+                    if (!values.contains(extractedValue)) {
+                        values.add(extractedValue);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadExtractedDataByHost", e);
+        }
+
+        return result;
+    }
+
+    public synchronized List<String> loadMatchedHosts() {
+        List<String> result = new ArrayList<>();
+        String querySql = String.format("""
+                SELECT DISTINCT host
+                FROM %s
+                WHERE regex_status = 'DONE' AND comment <> '' AND host <> ''
+                ORDER BY host ASC
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql);
+             ResultSet resultSet = statement.executeQuery()) {
+            boolean hasMatchedHost = false;
+            while (resultSet.next()) {
+                String host = resultSet.getString("host");
+                if (host == null || host.isBlank()) {
+                    continue;
+                }
+                hasMatchedHost = true;
+                addHostAggregationEntries(result, host);
+            }
+            if (hasMatchedHost && !result.contains("*")) {
+                result.add("*");
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadMatchedHosts", e);
+        }
+
+        return result;
+    }
+
+    private void addHostAggregationEntries(List<String> hosts, String host) {
+        if (!hosts.contains(host)) {
+            hosts.add(host);
+        }
+
+        String hostWithoutPort = StringProcessor.extractHostname(host);
+        if (hostWithoutPort == null || hostWithoutPort.isBlank() || StringProcessor.matchHostIsIp(hostWithoutPort)) {
+            return;
+        }
+
+        String[] segments = hostWithoutPort.split("\\.");
+        if (segments.length <= 2) {
+            return;
+        }
+
+        String wildcardHost = StringProcessor.replaceFirstOccurrence(hostWithoutPort, segments[0], "*");
+        if (!wildcardHost.isBlank() && !hosts.contains(wildcardHost)) {
+            hosts.add(wildcardHost);
+        }
     }
 
     private void appendFilterClause(StringBuilder querySql,
@@ -584,22 +1041,56 @@ public class SqliteMessageStore {
                     return null;
                 }
 
-                String serviceHost = resultSet.getString("service_host");
-                int servicePort = resultSet.getInt("service_port");
-                boolean serviceSecure = resultSet.getInt("service_secure") == 1;
-                byte[] requestBytes = resultSet.getBytes("request_bytes");
-                byte[] responseBytes = resultSet.getBytes("response_bytes");
-
-                HttpService httpService = HttpService.httpService(serviceHost, servicePort, serviceSecure);
-                HttpRequest httpRequest = HttpRequest.httpRequest(httpService, ByteArray.byteArray(requestBytes));
-                HttpResponse httpResponse = HttpResponse.httpResponse(ByteArray.byteArray(responseBytes));
-
-                return HttpRequestResponse.httpRequestResponse(httpRequest, httpResponse);
+                return toHttpRequestResponse(resultSet);
             }
         } catch (Exception e) {
             logDatabaseError("loadMessage", e);
             return null;
         }
+    }
+
+    public synchronized StoredMessage loadStoredMessage(String messageId) {
+        String querySql = String.format("""
+                SELECT host, service_host, service_port, service_secure, request_bytes, response_bytes
+                FROM %s
+                WHERE message_id = ?
+                """, TABLE_NAME);
+
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement(querySql)) {
+            statement.setString(1, messageId);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return null;
+                }
+
+                String host = resultSet.getString("host");
+                HttpRequestResponse requestResponse = toHttpRequestResponse(resultSet);
+                if (requestResponse == null) {
+                    return null;
+                }
+
+                return new StoredMessage(messageId, host, requestResponse);
+            }
+        } catch (Exception e) {
+            logDatabaseError("loadStoredMessage", e);
+            return null;
+        }
+    }
+
+    private HttpRequestResponse toHttpRequestResponse(ResultSet resultSet) throws SQLException {
+        String serviceHost = resultSet.getString("service_host");
+        int servicePort = resultSet.getInt("service_port");
+        boolean serviceSecure = resultSet.getInt("service_secure") == 1;
+        byte[] requestBytes = resultSet.getBytes("request_bytes");
+        byte[] responseBytes = resultSet.getBytes("response_bytes");
+
+        HttpService httpService = HttpService.httpService(serviceHost, servicePort, serviceSecure);
+        HttpRequest httpRequest = HttpRequest.httpRequest(httpService, ByteArray.byteArray(requestBytes));
+        HttpResponse httpResponse = HttpResponse.httpResponse(ByteArray.byteArray(responseBytes));
+
+        return HttpRequestResponse.httpRequestResponse(httpRequest, httpResponse);
     }
 
     public synchronized int deleteByHostPattern(String hostPattern) {
@@ -668,6 +1159,46 @@ public class SqliteMessageStore {
             logDatabaseError("deleteAllMessages", e);
             return 0;
         }
+    }
+
+    private String calculateContentHash(byte[] requestBytes, byte[] responseBytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            if (requestBytes != null) {
+                digest.update(requestBytes);
+            }
+            if (responseBytes != null) {
+                digest.update(responseBytes);
+            }
+            return bytesToHex(digest.digest());
+        } catch (Exception e) {
+            logDatabaseError("calculateContentHash", e);
+            return "";
+        }
+    }
+
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : bytes) {
+            String hex = Integer.toHexString(0xff & b);
+            if (hex.length() == 1) {
+                hexString.append('0');
+            }
+            hexString.append(hex);
+        }
+        return hexString.toString();
+    }
+
+    private String truncateError(String errorMessage) {
+        if (errorMessage == null) {
+            return "";
+        }
+
+        if (errorMessage.length() <= MAX_REGEX_ERROR_LENGTH) {
+            return errorMessage;
+        }
+
+        return errorMessage.substring(0, MAX_REGEX_ERROR_LENGTH);
     }
 
     public String getDatabasePath() {
