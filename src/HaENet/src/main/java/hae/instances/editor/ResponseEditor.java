@@ -1,8 +1,6 @@
 package hae.instances.editor;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.core.ByteArray;
-import burp.api.montoya.core.Range;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -10,7 +8,6 @@ import burp.api.montoya.ui.Selection;
 import burp.api.montoya.ui.editor.extension.EditorCreationContext;
 import burp.api.montoya.ui.editor.extension.ExtensionProvidedHttpResponseEditor;
 import burp.api.montoya.ui.editor.extension.HttpResponseEditorProvider;
-import hae.component.board.table.Datatable;
 import hae.instances.http.utils.MessageProcessor;
 import hae.utils.ConfigLoader;
 import hae.utils.http.HttpUtils;
@@ -61,7 +58,7 @@ public class ResponseEditor implements HttpResponseEditorProvider {
         @Override
         public void setRequestResponse(HttpRequestResponse requestResponse) {
             this.requestResponse = requestResponse;
-            RequestEditor.generateTabbedPaneFromResultMap(api, configLoader, jTabbedPane, this.dataList);
+            EditorUtils.generateTabbedPaneFromResultMap(api, configLoader, jTabbedPane, this.dataList);
         }
 
         @Override
@@ -85,7 +82,7 @@ public class ResponseEditor implements HttpResponseEditorProvider {
 
                 if (!matches) {
                     this.dataList = messageProcessor.processResponse("", response, false);
-                    return RequestEditor.isListHasData(this.dataList);
+                    return EditorUtils.isListHasData(this.dataList);
                 }
             }
 
@@ -104,18 +101,7 @@ public class ResponseEditor implements HttpResponseEditorProvider {
 
         @Override
         public Selection selectedData() {
-            return new Selection() {
-                @Override
-                public ByteArray contents() {
-                    Datatable dataTable = (Datatable) jTabbedPane.getSelectedComponent();
-                    return ByteArray.byteArray(dataTable.getSelectedDataAtTable(dataTable.getDataTable()));
-                }
-
-                @Override
-                public Range offsets() {
-                    return null;
-                }
-            };
+            return EditorUtils.selectedDataFrom(jTabbedPane);
         }
 
         @Override
