@@ -6,6 +6,10 @@ import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
+import hae.repository.ExtractedDataRepository;
+import hae.repository.MessageRepository;
+import hae.repository.RegexWorkRepository;
+import hae.repository.StorageMaintenanceRepository;
 import hae.utils.ConfigLoader;
 import hae.utils.string.StringProcessor;
 import org.sqlite.SQLiteDataSource;
@@ -25,7 +29,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class SqliteMessageStore {
+public class SqliteMessageStore implements MessageRepository,
+        RegexWorkRepository,
+        ExtractedDataRepository,
+        StorageMaintenanceRepository {
     private static final String TABLE_NAME = "message_history";
     private static final String MATCH_TABLE_NAME = "message_match";
     private static final String REGEX_STATUS_PENDING = "PENDING";
@@ -321,6 +328,7 @@ public class SqliteMessageStore {
         return false;
     }
 
+    @Override
     public synchronized PendingMessageSaveResult savePendingMessage(String messageId,
                                                                     HttpRequestResponse messageInfo,
                                                                     String url,
@@ -409,6 +417,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized void saveMessage(String messageId,
                                          HttpRequestResponse messageInfo,
                                          String url,
@@ -493,6 +502,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized boolean markRegexProcessing(String messageId) {
         String updateSql = String.format("""
                 UPDATE %s
@@ -514,6 +524,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized boolean completeRegexProcessing(String messageId,
                                                         String comment,
                                                         String color,
@@ -549,6 +560,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized boolean failRegexProcessing(String messageId, String errorMessage) {
         String updateSql = String.format("""
                 UPDATE %s
@@ -568,6 +580,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized boolean resetRegexProcessing(String messageId, String errorMessage) {
         String updateSql = String.format("""
                 UPDATE %s
@@ -587,6 +600,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized List<String> loadPendingRegexMessageIds(int limit) {
         int safeLimit = Math.max(1, limit);
         List<String> result = new ArrayList<>();
@@ -654,6 +668,7 @@ public class SqliteMessageStore {
         insertMatchStatement.executeBatch();
     }
 
+    @Override
     public synchronized List<MessageMetadata> loadMessageMetadata() {
         List<MessageMetadata> result = new ArrayList<>();
         String querySql = String.format("""
@@ -686,6 +701,7 @@ public class SqliteMessageStore {
         return result;
     }
 
+    @Override
     public synchronized boolean existsDuplicate(String url, String comment, String color, String contentHash) {
         String querySql = String.format("""
                 SELECT 1
@@ -710,6 +726,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized boolean existsDuplicateContent(String contentHash) {
         if (contentHash == null || contentHash.isBlank()) {
             return false;
@@ -735,10 +752,12 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized int countMessageMetadata(String hostPattern, String commentKeyword) {
         return countMessageMetadata(hostPattern, commentKeyword, "", "");
     }
 
+    @Override
     public synchronized int countMessageMetadata(String hostPattern, String commentKeyword, String messageTableName, String messageFilterValue) {
         StringBuilder querySql = new StringBuilder(String.format("SELECT COUNT(*) AS total FROM %s WHERE regex_status = 'DONE' AND comment <> ''", TABLE_NAME));
         List<Object> parameters = new ArrayList<>();
@@ -759,10 +778,12 @@ public class SqliteMessageStore {
         return 0;
     }
 
+    @Override
     public synchronized List<MessageMetadata> loadMessageMetadataPage(String hostPattern, String commentKeyword, int limit, int offset) {
         return loadMessageMetadataPage(hostPattern, commentKeyword, "", "", limit, offset);
     }
 
+    @Override
     public synchronized List<MessageMetadata> loadMessageMetadataPage(String hostPattern,
                                                                       String commentKeyword,
                                                                       String messageTableName,
@@ -810,10 +831,12 @@ public class SqliteMessageStore {
         return result;
     }
 
+    @Override
     public synchronized List<MessageMetadata> loadMessageMetadataByFilter(String hostPattern, String commentKeyword) {
         return loadMessageMetadataByFilter(hostPattern, commentKeyword, "", "");
     }
 
+    @Override
     public synchronized List<MessageMetadata> loadMessageMetadataByFilter(String hostPattern,
                                                                           String commentKeyword,
                                                                           String messageTableName,
@@ -854,6 +877,7 @@ public class SqliteMessageStore {
         return result;
     }
 
+    @Override
     public synchronized Map<String, List<String>> loadExtractedDataByHost(String hostPattern) {
         Map<String, List<String>> result = new java.util.LinkedHashMap<>();
         StringBuilder querySql = new StringBuilder(String.format("""
@@ -889,6 +913,7 @@ public class SqliteMessageStore {
         return result;
     }
 
+    @Override
     public synchronized List<String> loadMatchedHosts() {
         List<String> result = new ArrayList<>();
         String querySql = String.format("""
@@ -1025,6 +1050,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized HttpRequestResponse loadMessage(String messageId) {
         String querySql = String.format("""
                 SELECT service_host, service_port, service_secure, request_bytes, response_bytes
@@ -1049,6 +1075,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized StoredMessage loadStoredMessage(String messageId) {
         String querySql = String.format("""
                 SELECT host, service_host, service_port, service_secure, request_bytes, response_bytes
@@ -1093,6 +1120,7 @@ public class SqliteMessageStore {
         return HttpRequestResponse.httpRequestResponse(httpRequest, httpResponse);
     }
 
+    @Override
     public synchronized int deleteByHostPattern(String hostPattern) {
         if (hostPattern == null || hostPattern.isBlank()) {
             return 0;
@@ -1146,6 +1174,7 @@ public class SqliteMessageStore {
         }
     }
 
+    @Override
     public synchronized int deleteAllMessages() {
         String deleteSql = String.format("DELETE FROM %s", TABLE_NAME);
         String deleteMatchSql = String.format("DELETE FROM %s", MATCH_TABLE_NAME);
@@ -1201,6 +1230,7 @@ public class SqliteMessageStore {
         return errorMessage.substring(0, MAX_REGEX_ERROR_LENGTH);
     }
 
+    @Override
     public String getDatabasePath() {
         return dbPath;
     }
