@@ -116,6 +116,9 @@ Temporary Items
 **/build/
 !src/**/build/
 
+# Local Sisyphus orchestration state and evidence
+.sisyphus/
+
 # Ignore Gradle GUI config
 gradle-app.setting
 
