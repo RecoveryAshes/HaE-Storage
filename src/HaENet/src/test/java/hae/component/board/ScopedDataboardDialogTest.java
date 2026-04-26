@@ -175,6 +175,56 @@ class ScopedDataboardDialogTest {
         });
     }
 
+    @Test
+    void closeScopedResourcesDeletesCompletedScopeWithoutTouchingMainHistory() throws Exception {
+        withTokenRule(() -> {
+            StoreContext context = createStoreContext(tempDirectory.resolve("dialog-close-cleanup"));
+            context.store().saveMessage(
+                    "main-message-1",
+                    httpRequestResponse("main.example.test", "/main?token=main123", 200),
+                    "https://main.example.test/main?token=main123",
+                    "GET",
+                    "200",
+                    "42",
+                    "main comment",
+                    "red",
+                    "main-content-hash",
+                    Map.of("MainRule", List.of("main123"))
+            );
+
+            ScopedDataboardDialog.ScopedAnalysisService service = new ScopedDataboardDialog.ScopedAnalysisService(
+                    context.api(),
+                    context.configLoader(),
+                    context.store()
+            );
+            ScopedDataboardDialog.ScopedAnalysisResult result = service.analyzeSelectedMessages(
+                    List.of(httpRequestResponse("example.test", "/close?token=abc123", 200)),
+                    ScopedDataboardDialog.SOURCE_SELECTED_MESSAGES,
+                    "completed close cleanup"
+            );
+            assertNotNull(result.getScopeId());
+            assertEquals(1, countRows(context.databasePath(), SCOPED_SCOPE_TABLE));
+            assertEquals(1, countRows(context.databasePath(), SCOPED_MESSAGE_TABLE));
+            assertEquals(1, countRows(context.databasePath(), SCOPED_MATCH_TABLE));
+
+            ScopedDataboardDialog dialog = headlessDialogFor(context, context.store());
+            setField(dialog, "scopeId", result.getScopeId());
+            setField(dialog, "scopedScopeDeleted", false);
+
+            dialog.closeScopedResources();
+            dialog.closeScopedResources();
+
+            assertAll(
+                    () -> assertTrue(dialog.isScopedResourcesClosedForTest()),
+                    () -> TestFixtures.assertSqlCount(context.databasePath(), MAIN_MESSAGE_TABLE, 1),
+                    () -> TestFixtures.assertSqlCount(context.databasePath(), MAIN_MATCH_TABLE, 1),
+                    () -> assertEquals(0, countRows(context.databasePath(), SCOPED_SCOPE_TABLE)),
+                    () -> assertEquals(0, countRows(context.databasePath(), SCOPED_MESSAGE_TABLE)),
+                    () -> assertEquals(0, countRows(context.databasePath(), SCOPED_MATCH_TABLE))
+            );
+        });
+    }
+
     private StoreContext createStoreContext(Path home) throws Exception {
         Files.createDirectories(home.resolve(".config").resolve("HaE"));
         String originalHome = System.getProperty("user.home");

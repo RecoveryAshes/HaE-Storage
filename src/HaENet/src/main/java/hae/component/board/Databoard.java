@@ -187,15 +187,7 @@ public class Databoard extends JPanel {
             if (getHostByList().contains(selectedHost)) {
                 hostTextField.setText(selectedHost);
                 hostComboBox.setPopupVisible(false);
-
-                if (handleComboBoxWorker != null && !handleComboBoxWorker.isDone()) {
-                    progressBar.setVisible(false);
-                    handleComboBoxWorker.cancel(true);
-                }
-
-                handleComboBoxWorker = new DataLoadingWorker(selectedHost);
-
-                handleComboBoxWorker.execute();
+                startDataLoadingWorker(selectedHost);
             }
         }
     }
@@ -214,7 +206,7 @@ public class Databoard extends JPanel {
 
         if (keyCode == KeyEvent.VK_ENTER) {
             isMatchHost = false;
-            handleComboBoxAction(null);
+            loadHostFromInput();
         }
 
         if (keyCode == KeyEvent.VK_ESCAPE) {
@@ -222,6 +214,45 @@ public class Databoard extends JPanel {
         }
 
         isMatchHost = false;
+    }
+
+    void loadHostFromInputForTest() {
+        loadHostFromInput();
+    }
+
+    boolean isSplitPaneVisibleForTest() {
+        return splitPane.isVisible();
+    }
+
+    int getDataTabCountForTest() {
+        return dataTabbedPane.getTabCount();
+    }
+
+    int getMessageTableRowCountForTest() {
+        return messageTableModel.getRowCount();
+    }
+
+    JTextField getHostTextFieldForTest() {
+        return hostTextField;
+    }
+
+    private void loadHostFromInput() {
+        String selectedHost = hostTextField.getText() == null ? "" : hostTextField.getText().trim();
+        if (selectedHost.isEmpty()) {
+            return;
+        }
+        hostComboBox.setPopupVisible(false);
+        startDataLoadingWorker(selectedHost);
+    }
+
+    private void startDataLoadingWorker(String selectedHost) {
+        if (handleComboBoxWorker != null && !handleComboBoxWorker.isDone()) {
+            progressBar.setVisible(false);
+            handleComboBoxWorker.cancel(true);
+        }
+
+        handleComboBoxWorker = new DataLoadingWorker(selectedHost);
+        handleComboBoxWorker.execute();
     }
 
     private Map<String, List<String>> getSelectedMapByHost(String selectedHost, DataLoadingWorker worker) {

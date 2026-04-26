@@ -78,6 +78,7 @@ public class ScopedDataboardDialog extends JDialog {
     private ScopedMessageTableModel.ScopedMessageTable messageTable;
     private SwingWorker<ScopedAnalysisResult, Void> analysisWorker;
     private volatile boolean scopedResourcesClosed;
+    private volatile boolean scopedScopeDeleted;
     private String scopeId;
 
     public static ScopedDataboardDialog fromSelectedMessages(Window owner,
@@ -323,6 +324,19 @@ public class ScopedDataboardDialog extends JDialog {
         }
         if (scopedMessageTableModel != null) {
             scopedMessageTableModel.shutdown();
+        }
+        deleteCurrentScope();
+    }
+
+    private void deleteCurrentScope() {
+        if (scopedScopeDeleted || scopeId == null || scopeId.isBlank()) {
+            return;
+        }
+        scopedScopeDeleted = true;
+        try {
+            scopedRepository.deleteScopedDataboardScope(scopeId);
+        } catch (Exception e) {
+            logError("deleteScopedDataboardScope", e);
         }
     }
 
