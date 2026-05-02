@@ -18,6 +18,8 @@ class RepositoryContractTest {
                 () -> assertTrue(RegexWorkRepository.class.isAssignableFrom(implementation)),
                 () -> assertTrue(ExtractedDataRepository.class.isAssignableFrom(implementation)),
                 () -> assertTrue(ScopedDataboardRepository.class.isAssignableFrom(implementation)),
+                () -> assertTrue(AiTaskRepository.class.isAssignableFrom(implementation)),
+                () -> assertTrue(AiResultRepository.class.isAssignableFrom(implementation)),
                 () -> assertTrue(StorageMaintenanceRepository.class.isAssignableFrom(implementation))
         );
     }
@@ -81,6 +83,89 @@ class RepositoryContractTest {
                         String.class,
                         String.class
                 )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod(
+                        "enqueueAiTriageTask",
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        int.class,
+                        int.class,
+                        long.class
+                )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod(
+                        "leaseNextAiTriageTasks",
+                        int.class,
+                        long.class,
+                        long.class
+                )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod(
+                        "leaseNextAiTriageTasks",
+                        int.class,
+                        long.class,
+                        long.class,
+                        String.class
+                )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("countActiveAiTriageTasks")),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("hasAiTriageForMessage", String.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("hasBlockingAiTriageForMessage", String.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("hasBlockingAiTriageForTarget", String.class, String.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("completeAiTriageTask", String.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("completeAiTriageTask", String.class, String.class, String.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod(
+                        "completeAiTriageTaskWithResult",
+                        String.class,
+                        String.class,
+                        String.class,
+                        AiTaskRepository.AiTriageResultWrite.class
+                )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod(
+                        "failAiTriageTask",
+                        String.class,
+                        String.class,
+                        String.class,
+                        long.class
+                )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod(
+                        "failAiTriageTask",
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        long.class
+                )),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("releaseAiTriageTask", String.class, long.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("releaseAiTriageTask", String.class, String.class, String.class, long.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("recoverStaleAiTriageTasks", long.class)),
+                () -> assertDoesNotThrow(() -> AiTaskRepository.class.getMethod("cleanupOrphanAiTriageTasks")),
+                () -> assertDoesNotThrow(() -> AiResultRepository.class.getMethod(
+                        "saveAiTriageResult",
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        double.class,
+                        String.class,
+                        String.class,
+                        long.class,
+                        String.class,
+                        String.class,
+                        String.class,
+                        String.class
+                )),
+                () -> assertDoesNotThrow(() -> AiResultRepository.class.getMethod("loadAiTriageResultSummaries", java.util.List.class)),
+                () -> assertDoesNotThrow(() -> AiResultRepository.class.getMethod("loadAiTriageResultSummaries", java.util.List.class, String.class)),
+                () -> assertDoesNotThrow(() -> AiResultRepository.class.getMethod("loadAiTriageResultJson", String.class)),
+                () -> assertDoesNotThrow(() -> AiResultRepository.class.getMethod("loadAiTriageResultJson", String.class, String.class)),
+                () -> assertDoesNotThrow(() -> AiResultRepository.class.getMethod("cleanupOrphanAiTriageResults")),
                 () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteByHostPattern", String.class)),
                 () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteAllMessages")),
                 () -> assertDoesNotThrow(() -> StorageMaintenanceRepository.class.getMethod("deleteAllScopedDataboardScopes"))

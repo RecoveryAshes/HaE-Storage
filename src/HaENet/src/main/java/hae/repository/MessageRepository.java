@@ -85,4 +85,7 @@ public interface MessageRepository {
 
     /** Load the stored request/response bytes with host metadata for regex workers. */
     SqliteMessageStore.StoredMessage loadStoredMessage(String messageId);
+
+    /** Load extracted regex match data for exactly one persisted message id. */
+    Map<String, List<String>> loadMessageExtractedData(String messageId);
 }
