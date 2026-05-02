@@ -11,7 +11,12 @@ import burp.api.montoya.ui.UserInterface;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 import hae.Config;
+import hae.ai.AiTriageEnqueueService;
+import hae.ai.AiTriageTargetSignature;
+import hae.ai.AiWhitelistRules;
+import hae.repository.AiResultRepository;
 import hae.instances.http.utils.MessageProcessor;
+import hae.repository.AiTaskRepository;
 import hae.repository.ExtractedDataRepository;
 import hae.repository.MessageRepository;
 import hae.repository.RegexWorkRepository;
@@ -26,7 +31,10 @@ import javax.swing.table.AbstractTableModel;
 import javax.swing.table.TableModel;
 import javax.swing.table.TableRowSorter;
 import java.awt.BorderLayout;
+import java.awt.Dimension;
 import java.awt.FlowLayout;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -42,9 +50,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static burp.api.montoya.ui.editor.EditorOptions.READ_ONLY;
 
@@ -55,17 +65,24 @@ public class MessageTableModel extends AbstractTableModel {
     private static final int PENDING_ANNOTATION_CAPACITY = 10000;
     private static final int PENDING_RECOVERY_BATCH_SIZE = 200;
     private static final long PENDING_RECOVERY_IDLE_MILLIS = 5000L;
+    private static final int BASE_COLUMN_COUNT = 6;
+    private static final double TABLE_DETAIL_INITIAL_HEIGHT_RATIO = 0.50;
 
     private final MontoyaApi api;
     private final ConfigLoader configLoader;
     private final MessageRepository messageRepository;
+    private final AiResultRepository aiResultRepository;
+    private final AiTaskRepository aiTaskRepository;
     private final RegexWorkRepository regexWorkRepository;
     private final ExtractedDataRepository extractedDataRepository;
     private final StorageMaintenanceRepository storageMaintenanceRepository;
     private final MessageProcessor messageProcessor;
+    private final AiTriageEnqueueService aiTriageEnqueueService;
     private final HttpUtils httpUtils;
     private final MessageTable messageTable;
+    private final JTextArea aiDetailArea;
     private final JSplitPane splitPane;
+    private final JSplitPane tableAndMessagePane;
     private final LinkedList<MessageEntry> pageLog;
 
     private final JButton previousPageButton = new JButton("<");
@@ -85,10 +102,12 @@ public class MessageTableModel extends AbstractTableModel {
     private SwingWorker<Void, Void> currentWorker;
     private SwingWorker<PageQueryResult, Void> pageWorker;
     private final AtomicInteger queryVersion = new AtomicInteger(0);
+    private final AtomicLong selectionGeneration = new AtomicLong(0L);
     private final BlockingQueue<String> regexQueue = new LinkedBlockingQueue<>(REGEX_QUEUE_CAPACITY);
     private final Set<String> queuedRegexMessageIds = ConcurrentHashMap.newKeySet();
     private final ExecutorService regexExecutorService;
     private final AtomicBoolean regexWorkerRunning = new AtomicBoolean(true);
+    private final AtomicBoolean shutdownRequested = new AtomicBoolean(false);
     private final AtomicBoolean pageRefreshQueued = new AtomicBoolean(false);
     private final Map<String, Annotations> pendingAnnotations = Collections.synchronizedMap(new LinkedHashMap<>());
 
@@ -116,13 +135,38 @@ public class MessageTableModel extends AbstractTableModel {
         }
     }
 
+    private record AiTargetSnapshot(String ruleName, String value, String matchSignatureHash) {
+        private boolean exact() {
+            return !ruleName.isBlank() && !value.isBlank() && !matchSignatureHash.isBlank();
+        }
+
+        private static AiTargetSnapshot empty() {
+            return new AiTargetSnapshot("", "", "");
+        }
+
+        private static AiTargetSnapshot exact(String ruleName, String value) {
+            String normalizedRuleName = ruleName == null ? "" : ruleName.trim();
+            String normalizedValue = value == null ? "" : value.trim();
+            if (normalizedRuleName.isEmpty() || normalizedValue.isEmpty()
+                    || "*".equals(normalizedRuleName) || "*".equals(normalizedValue)) {
+                return empty();
+            }
+            return new AiTargetSnapshot(
+                    normalizedRuleName,
+                    normalizedValue,
+                    AiTriageTargetSignature.matchSignatureHash(normalizedRuleName, normalizedValue)
+            );
+        }
+    }
+
     public MessageTableModel(MontoyaApi api,
                              ConfigLoader configLoader,
                              MessageRepository messageRepository,
                              RegexWorkRepository regexWorkRepository,
                              ExtractedDataRepository extractedDataRepository,
                              StorageMaintenanceRepository storageMaintenanceRepository) {
-        this(api, configLoader, messageRepository, regexWorkRepository, extractedDataRepository, storageMaintenanceRepository, true);
+        this(api, configLoader, messageRepository, regexWorkRepository, extractedDataRepository,
+                storageMaintenanceRepository, defaultAiTriageEnqueueService(messageRepository), true);
     }
 
     MessageTableModel(MontoyaApi api,
@@ -132,13 +176,28 @@ public class MessageTableModel extends AbstractTableModel {
                       ExtractedDataRepository extractedDataRepository,
                       StorageMaintenanceRepository storageMaintenanceRepository,
                       boolean startRegexWorkers) {
+        this(api, configLoader, messageRepository, regexWorkRepository, extractedDataRepository,
+                storageMaintenanceRepository, defaultAiTriageEnqueueService(messageRepository), startRegexWorkers);
+    }
+
+    MessageTableModel(MontoyaApi api,
+                      ConfigLoader configLoader,
+                      MessageRepository messageRepository,
+                      RegexWorkRepository regexWorkRepository,
+                      ExtractedDataRepository extractedDataRepository,
+                      StorageMaintenanceRepository storageMaintenanceRepository,
+                      AiTriageEnqueueService aiTriageEnqueueService,
+                      boolean startRegexWorkers) {
         this.api = Objects.requireNonNull(api, "api");
         this.configLoader = Objects.requireNonNull(configLoader, "configLoader");
         this.messageRepository = Objects.requireNonNull(messageRepository, "messageRepository");
+        this.aiResultRepository = messageRepository instanceof AiResultRepository resultRepository ? resultRepository : null;
+        this.aiTaskRepository = messageRepository instanceof AiTaskRepository taskRepository ? taskRepository : null;
         this.regexWorkRepository = Objects.requireNonNull(regexWorkRepository, "regexWorkRepository");
         this.extractedDataRepository = Objects.requireNonNull(extractedDataRepository, "extractedDataRepository");
         this.storageMaintenanceRepository = Objects.requireNonNull(storageMaintenanceRepository, "storageMaintenanceRepository");
         this.messageProcessor = new MessageProcessor(api, configLoader);
+        this.aiTriageEnqueueService = aiTriageEnqueueService;
         this.httpUtils = new HttpUtils(api, configLoader);
         this.pageLog = new LinkedList<>();
         this.regexExecutorService = Executors.newFixedThreadPool(REGEX_WORKER_COUNT);
@@ -150,6 +209,12 @@ public class MessageTableModel extends AbstractTableModel {
         messagePane.setLeftComponent(requestViewer.uiComponent());
         messagePane.setRightComponent(responseViewer.uiComponent());
         messagePane.setResizeWeight(0.5);
+        aiDetailArea = new JTextArea("选中一条消息后显示 AI 分析详情。", 8, 32);
+        aiDetailArea.setEditable(false);
+        aiDetailArea.setLineWrap(true);
+        aiDetailArea.setWrapStyleWord(true);
+        JScrollPane aiDetailScrollPane = new JScrollPane(aiDetailArea);
+        aiDetailScrollPane.setBorder(BorderFactory.createTitledBorder("AI 详情"));
 
         messageTable = new MessageTable(this, requestViewer, responseViewer);
         messageTable.setDefaultRenderer(Object.class, new MessageRenderer(pageLog, messageTable));
@@ -159,20 +224,49 @@ public class MessageTableModel extends AbstractTableModel {
         messageTable.setRowSorter(sorter);
         messageTable.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
 
-        splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        tableAndMessagePane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
         JScrollPane scrollPane = new JScrollPane(messageTable);
         scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
         scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_ALWAYS);
         JPanel tablePanel = new JPanel(new BorderLayout());
         tablePanel.add(scrollPane, BorderLayout.CENTER);
         tablePanel.add(createPaginationPanel(), BorderLayout.SOUTH);
-        splitPane.setLeftComponent(tablePanel);
-        splitPane.setRightComponent(messagePane);
+        tablePanel.setMinimumSize(new Dimension(0, 180));
+        messagePane.setMinimumSize(new Dimension(0, 220));
+        tableAndMessagePane.setLeftComponent(tablePanel);
+        tableAndMessagePane.setRightComponent(messagePane);
+        tableAndMessagePane.setResizeWeight(TABLE_DETAIL_INITIAL_HEIGHT_RATIO);
+        tableAndMessagePane.addComponentListener(new ComponentAdapter() {
+            private boolean dividerInitialized;
+
+            @Override
+            public void componentResized(ComponentEvent e) {
+                initializeTableAndMessageDivider(this);
+            }
+
+            private void initializeTableAndMessageDivider(ComponentAdapter listener) {
+                if (dividerInitialized || tableAndMessagePane.getHeight() <= 0) {
+                    return;
+                }
+                dividerInitialized = true;
+                tableAndMessagePane.setDividerLocation(TABLE_DETAIL_INITIAL_HEIGHT_RATIO);
+                tableAndMessagePane.removeComponentListener(listener);
+            }
+        });
+        splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, tableAndMessagePane, aiDetailScrollPane);
+        splitPane.setResizeWeight(0.86);
 
         updatePaginationControls();
         if (startRegexWorkers) {
             startRegexWorkers();
         }
+    }
+
+    private static AiTriageEnqueueService defaultAiTriageEnqueueService(MessageRepository messageRepository) {
+        if (messageRepository instanceof AiTaskRepository aiTaskRepository) {
+            return new AiTriageEnqueueService(aiTaskRepository);
+        }
+        return null;
     }
 
     private JPanel createPaginationPanel() {
@@ -228,6 +322,8 @@ public class MessageTableModel extends AbstractTableModel {
             }
             fireTableDataChanged();
             messageTable.lastSelectedIndex = -1;
+            selectionGeneration.incrementAndGet();
+            refreshSelectionAfterPageLoad();
         };
 
         if (SwingUtilities.isEventDispatchThread()) {
@@ -235,6 +331,18 @@ public class MessageTableModel extends AbstractTableModel {
         } else {
             SwingUtilities.invokeLater(uiUpdate);
         }
+    }
+
+    private void refreshSelectionAfterPageLoad() {
+        if (pageLog.isEmpty()) {
+            aiDetailArea.setText("暂无 AI 结果。");
+            return;
+        }
+        if (messageTable.getSelectedRow() < 0) {
+            messageTable.changeSelection(0, 0, false, false);
+            return;
+        }
+        messageTable.refreshSelectedMessageAsync();
     }
 
     private void updatePaginationControls() {
@@ -263,7 +371,7 @@ public class MessageTableModel extends AbstractTableModel {
         }
     }
 
-    private List<MessageEntry> toMessageEntries(List<SqliteMessageStore.MessageMetadata> metadataList) {
+    private List<MessageEntry> toMessageEntries(List<SqliteMessageStore.MessageMetadata> metadataList, AiTargetSnapshot aiTarget) {
         List<MessageEntry> entries = new ArrayList<>(metadataList.size());
         for (SqliteMessageStore.MessageMetadata metadata : metadataList) {
             entries.add(new MessageEntry(
@@ -274,7 +382,10 @@ public class MessageTableModel extends AbstractTableModel {
                     metadata.getLength(),
                     metadata.getColor(),
                     metadata.getStatus(),
-                    metadata.getContentHash()
+                    metadata.getContentHash(),
+                    aiTarget.exact() ? aiTarget.ruleName() : "",
+                    aiTarget.exact() ? aiTarget.value() : "",
+                    aiTarget.exact() ? aiTarget.matchSignatureHash() : ""
             ));
         }
         return entries;
@@ -289,6 +400,9 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     private void loadPageFromDatabase() {
+        if (shutdownRequested.get()) {
+            return;
+        }
         if (pageWorker != null && !pageWorker.isDone()) {
             pageWorker.cancel(true);
         }
@@ -300,21 +414,25 @@ public class MessageTableModel extends AbstractTableModel {
         String commentFilter = currentCommentFilter;
         String messageTableFilter = currentMessageTable;
         String messageValueFilter = currentMessageFilter;
+        AiTargetSnapshot aiTarget = AiTargetSnapshot.exact(messageTableFilter, messageValueFilter);
 
         pageWorker = new SwingWorker<>() {
             @Override
             protected PageQueryResult doInBackground() {
+                if (shutdownRequested.get()) {
+                    return new PageQueryResult(Collections.emptyList(), 0, 1);
+                }
                 int count = messageRepository.countMessageMetadata(hostFilter, commentFilter, messageTableFilter, messageValueFilter);
                 int totalPages = Math.max(1, (count + requestedPageSize - 1) / requestedPageSize);
                 int safePage = Math.max(1, Math.min(requestedPage, totalPages));
                 int offset = (safePage - 1) * requestedPageSize;
                 List<SqliteMessageStore.MessageMetadata> metadata = messageRepository.loadMessageMetadataPage(hostFilter, commentFilter, messageTableFilter, messageValueFilter, requestedPageSize, offset);
-                return new PageQueryResult(toMessageEntries(metadata), count, safePage);
+                return new PageQueryResult(toMessageEntries(metadata, aiTarget), count, safePage);
             }
 
             @Override
             protected void done() {
-                if (isCancelled() || requestId != queryVersion.get()) {
+                if (isCancelled() || shutdownRequested.get() || requestId != queryVersion.get()) {
                     return;
                 }
 
@@ -427,6 +545,7 @@ public class MessageTableModel extends AbstractTableModel {
                     processedMessage.getExtractedDataByRule()
             );
             if (completed) {
+                enqueueAiTriageAfterRegexCompletion(storedMessage, requestResponse, processedMessage);
                 applyPendingAnnotation(messageId, processedMessage);
                 refreshCurrentPageLater();
             } else {
@@ -437,6 +556,29 @@ public class MessageTableModel extends AbstractTableModel {
             regexWorkRepository.failRegexProcessing(messageId, e.getMessage());
             removePendingAnnotation(messageId);
             api.logging().logToError("processRegexMessage: " + e.getMessage());
+        }
+    }
+
+    private void enqueueAiTriageAfterRegexCompletion(SqliteMessageStore.StoredMessage storedMessage,
+                                                     HttpRequestResponse requestResponse,
+                                                     MessageProcessor.ProcessedMessage processedMessage) {
+        if (aiTriageEnqueueService == null || storedMessage == null || processedMessage == null) {
+            return;
+        }
+
+        try {
+            AiTriageEnqueueService.EnqueueResult result = aiTriageEnqueueService.enqueueAfterRegexPersistence(
+                    storedMessage.getMessageId(),
+                    storedMessage.getContentHash(),
+                    requestResponse,
+                    processedMessage.getExtractedDataByRule(),
+                    configLoader.getAiConfig()
+            );
+            if ("failed".equals(result.getStatus())) {
+                api.logging().logToError("enqueueAiTriageAfterRegexCompletion: " + result.getReason());
+            }
+        } catch (Exception e) {
+            api.logging().logToError("enqueueAiTriageAfterRegexCompletion: " + e.getMessage());
         }
     }
 
@@ -465,12 +607,18 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     private void refreshCurrentPageLater() {
+        if (shutdownRequested.get()) {
+            return;
+        }
         if (!pageRefreshQueued.compareAndSet(false, true)) {
             return;
         }
 
         SwingUtilities.invokeLater(() -> {
             pageRefreshQueued.set(false);
+            if (shutdownRequested.get()) {
+                return;
+            }
             loadPageFromCurrentState(false);
         });
     }
@@ -700,13 +848,16 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     public void clearAllDataOnShutdown() {
+        shutdownRequested.set(true);
         try {
             if (currentWorker != null && !currentWorker.isDone()) {
                 currentWorker.cancel(true);
+                awaitWorkerCompletion(currentWorker, "clearAllDataOnShutdown(currentWorker)");
             }
 
             if (pageWorker != null && !pageWorker.isDone()) {
                 pageWorker.cancel(true);
+                awaitWorkerCompletion(pageWorker, "clearAllDataOnShutdown(pageWorker)");
             }
         } catch (Exception e) {
             api.logging().logToError("clearAllDataOnShutdown(cancel): " + e.getMessage());
@@ -715,11 +866,23 @@ public class MessageTableModel extends AbstractTableModel {
         try {
             regexWorkerRunning.set(false);
             regexExecutorService.shutdownNow();
+            if (!regexExecutorService.awaitTermination(2, TimeUnit.SECONDS)) {
+                api.logging().logToError("clearAllDataOnShutdown(regex): regex executor did not terminate promptly");
+            }
             regexQueue.clear();
             queuedRegexMessageIds.clear();
             pendingAnnotations.clear();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            api.logging().logToError("clearAllDataOnShutdown(regex): interrupted while waiting for shutdown");
         } catch (Exception e) {
             api.logging().logToError("clearAllDataOnShutdown(regex): " + e.getMessage());
+        }
+
+        try {
+            messageTable.shutdown();
+        } catch (Exception e) {
+            api.logging().logToError("clearAllDataOnShutdown(table): " + e.getMessage());
         }
 
         try {
@@ -729,16 +892,29 @@ public class MessageTableModel extends AbstractTableModel {
             synchronized (pageLog) {
                 pageLog.clear();
             }
+            selectionGeneration.incrementAndGet();
             totalRows = 0;
             currentPage = 1;
         } catch (Exception e) {
             api.logging().logToError("clearAllDataOnShutdown(delete): " + e.getMessage());
         }
+    }
+
+    private void awaitWorkerCompletion(SwingWorker<?, ?> worker, String context) {
+        if (worker == null || worker.isDone()) {
+            return;
+        }
 
         try {
-            messageTable.shutdown();
+            worker.get(2, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.CancellationException ignored) {
+        } catch (java.util.concurrent.TimeoutException e) {
+            api.logging().logToError(context + ": worker did not terminate promptly");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            api.logging().logToError(context + ": interrupted while waiting for worker shutdown");
         } catch (Exception e) {
-            api.logging().logToError("clearAllDataOnShutdown(table): " + e.getMessage());
+            api.logging().logToError(context + ": " + e.getMessage());
         }
     }
 
@@ -746,8 +922,112 @@ public class MessageTableModel extends AbstractTableModel {
         return storageMaintenanceRepository.getDatabasePath();
     }
 
+    public AiTaskRepository getAiTaskRepositoryForSettings() {
+        return messageRepository instanceof AiTaskRepository aiTaskRepository ? aiTaskRepository : null;
+    }
+
     public Map<String, List<String>> loadExtractedDataByHost(String hostPattern) {
         return extractedDataRepository.loadExtractedDataByHost(hostPattern);
+    }
+
+    public Map<String, Map<String, AiSummaryDisplay>> loadAiSummariesByRuleValue(String hostPattern,
+                                                                                  Map<String, List<String>> extractedDataByRule) {
+        if (aiResultRepository == null || extractedDataByRule == null || extractedDataByRule.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, Map<String, AiSummaryDisplay>> result = new LinkedHashMap<>();
+        String normalizedHostPattern = (hostPattern == null || hostPattern.trim().isEmpty()) ? "*" : hostPattern.trim();
+        for (Map.Entry<String, List<String>> entry : extractedDataByRule.entrySet()) {
+            String ruleName = entry.getKey();
+            if (ruleName == null || ruleName.isBlank()) {
+                continue;
+            }
+            Map<String, AiSummaryDisplay> summariesByValue = new LinkedHashMap<>();
+            for (String value : entry.getValue()) {
+                AiSummaryDisplay summary = loadAiSummaryForRuleValue(normalizedHostPattern, ruleName, value);
+                summariesByValue.put(value, summary);
+            }
+            result.put(ruleName, summariesByValue);
+        }
+        return result;
+    }
+
+    private AiSummaryDisplay loadAiSummaryForRuleValue(String hostPattern, String ruleName, String value) {
+        if (ruleName == null || ruleName.isBlank() || value == null || value.isBlank()) {
+            return AiSummaryDisplay.empty();
+        }
+        List<SqliteMessageStore.MessageMetadata> metadataList = messageRepository.loadMessageMetadataByFilter(hostPattern, "", ruleName, value);
+        if (metadataList.isEmpty()) {
+            return AiSummaryDisplay.empty();
+        }
+
+        List<String> messageIds = new ArrayList<>(metadataList.size());
+        for (SqliteMessageStore.MessageMetadata metadata : metadataList) {
+            if (metadata != null && metadata.getMessageId() != null && !metadata.getMessageId().isBlank()) {
+                messageIds.add(metadata.getMessageId());
+            }
+        }
+        if (messageIds.isEmpty()) {
+            return AiSummaryDisplay.empty();
+        }
+
+        String matchSignatureHash = AiTriageTargetSignature.matchSignatureHash(ruleName, value);
+        List<SqliteMessageStore.AiTriageResultSummary> summaries = aiResultRepository.loadAiTriageResultSummaries(messageIds, matchSignatureHash);
+        AiSummaryDisplay resultSummary = latestAiSummaryDisplay(summaries);
+        if (isDisplayPresent(resultSummary)) {
+            return resultSummary;
+        }
+        if (!isAiRuleAllowed(ruleName)) {
+            return AiSummaryDisplay.disallowedRule();
+        }
+        if (aiTaskRepository != null) {
+            AiSummaryDisplay taskSummary = latestTaskSummaryDisplay(aiTaskRepository.loadAiTriageTaskSummaries(messageIds, matchSignatureHash));
+            if (isDisplayPresent(taskSummary)) {
+                return taskSummary;
+            }
+        }
+        return AiSummaryDisplay.empty();
+    }
+
+    private AiSummaryDisplay latestAiSummaryDisplay(List<SqliteMessageStore.AiTriageResultSummary> summaries) {
+        if (summaries == null || summaries.isEmpty()) {
+            return AiSummaryDisplay.empty();
+        }
+        SqliteMessageStore.AiTriageResultSummary latestSummary = summaries.get(0);
+        for (SqliteMessageStore.AiTriageResultSummary summary : summaries) {
+            if (summary != null && (latestSummary == null || summary.getAnalyzedAt() > latestSummary.getAnalyzedAt())) {
+                latestSummary = summary;
+            }
+        }
+        return AiSummaryFormatter.display(latestSummary);
+    }
+
+    private AiSummaryDisplay latestTaskSummaryDisplay(List<SqliteMessageStore.AiTriageTask> tasks) {
+        if (tasks == null || tasks.isEmpty()) {
+            return AiSummaryDisplay.empty();
+        }
+        SqliteMessageStore.AiTriageTask latestTask = tasks.get(0);
+        for (SqliteMessageStore.AiTriageTask task : tasks) {
+            if (task != null && (latestTask == null || task.getUpdatedAt() > latestTask.getUpdatedAt())) {
+                latestTask = task;
+            }
+        }
+        return AiSummaryFormatter.displayTask(latestTask);
+    }
+
+    private boolean isDisplayPresent(AiSummaryDisplay display) {
+        return display != null && (!display.getAiStatus().isBlank()
+                || !display.getAiVerdict().isBlank()
+                || !display.getAiConfidence().isBlank());
+    }
+
+    private boolean isAiRuleAllowed(String ruleName) {
+        try {
+            return AiWhitelistRules.allowsRule(configLoader.getAiConfig().getWhitelist(), ruleName);
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     public List<String> loadMatchedHosts() {
@@ -755,12 +1035,14 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     public void applyHostFilter(String filterText) {
+        selectionGeneration.incrementAndGet();
         currentHostFilter = (filterText == null || filterText.trim().isEmpty()) ? "*" : filterText.trim();
         resetMessageFilterState();
         loadPageFromCurrentState(true);
     }
 
     public void applyMessageFilter(String tableName, String filterText) {
+        selectionGeneration.incrementAndGet();
         String normalizedTableName = tableName == null ? "" : tableName.trim();
         String normalizedFilterText = filterText == null ? "" : filterText.trim();
 
@@ -782,6 +1064,7 @@ public class MessageTableModel extends AbstractTableModel {
     }
 
     public void applyCommentFilter(String tableName) {
+        selectionGeneration.incrementAndGet();
         currentCommentFilter = tableName == null ? "" : tableName.trim();
         resetMessageFilterState();
         loadPageFromCurrentState(true);
@@ -791,8 +1074,237 @@ public class MessageTableModel extends AbstractTableModel {
         return splitPane;
     }
 
+    public JSplitPane getTableAndMessageSplitPaneForTest() {
+        return tableAndMessagePane;
+    }
+
+    public String getAiDetailTextForTest() {
+        if (SwingUtilities.isEventDispatchThread()) {
+            return aiDetailArea.getText();
+        }
+        String[] text = new String[1];
+        try {
+            SwingUtilities.invokeAndWait(() -> text[0] = aiDetailArea.getText());
+            return text[0] == null ? "" : text[0];
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     public MessageTable getMessageTable() {
         return messageTable;
+    }
+
+    public String loadSelectedAiResultJson() {
+        if (aiResultRepository == null) {
+            return null;
+        }
+
+        int selectedRow = messageTable.getSelectedRow();
+        if (selectedRow < 0) {
+            return null;
+        }
+
+        int modelRow = messageTable.convertRowIndexToModel(selectedRow);
+        return loadAiResultJsonAtModelRow(modelRow);
+    }
+
+    public AiTriageEnqueueService.EnqueueResult enqueueSelectedAiTriage() {
+        if (aiTriageEnqueueService == null) {
+            return AiTriageEnqueueService.EnqueueResult.failed("AI 入队服务不可用");
+        }
+
+        int selectedRow = selectedModelRowForAiTriage();
+        if (selectedRow < 0) {
+            return AiTriageEnqueueService.EnqueueResult.failed("请先在右侧消息表中选中一条历史记录");
+        }
+        return enqueueAiTriageAtModelRow(selectedRow);
+    }
+
+    private int selectedModelRowForAiTriage() {
+        if (SwingUtilities.isEventDispatchThread()) {
+            return selectedModelRowOnEdt();
+        }
+        final int[] selectedModelRow = {-1};
+        try {
+            SwingUtilities.invokeAndWait(() -> selectedModelRow[0] = selectedModelRowOnEdt());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return -1;
+        } catch (Exception e) {
+            return -1;
+        }
+        return selectedModelRow[0];
+    }
+
+    private int selectedModelRowOnEdt() {
+        int selectedRow = messageTable.getSelectedRow();
+        return selectedRow < 0 ? -1 : messageTable.convertRowIndexToModel(selectedRow);
+    }
+
+    AiTriageEnqueueService.EnqueueResult enqueueAiTriageAtModelRow(int modelRow) {
+        MessageEntry messageEntry;
+        synchronized (pageLog) {
+            if (modelRow < 0 || modelRow >= pageLog.size()) {
+                return AiTriageEnqueueService.EnqueueResult.failed("选中的历史记录不存在");
+            }
+            messageEntry = pageLog.get(modelRow);
+        }
+
+        if (messageEntry == null || messageEntry.getMessageId() == null || messageEntry.getMessageId().isBlank()) {
+            return AiTriageEnqueueService.EnqueueResult.failed("选中的历史记录缺少 messageId");
+        }
+
+        HttpRequestResponse requestResponse = messageRepository.loadMessage(messageEntry.getMessageId());
+        if (requestResponse == null) {
+            return AiTriageEnqueueService.EnqueueResult.failed("无法读取选中历史记录的请求/响应");
+        }
+
+        Map<String, List<String>> extractedData = messageRepository.loadMessageExtractedData(messageEntry.getMessageId());
+        if (extractedData == null || extractedData.isEmpty()) {
+            return AiTriageEnqueueService.EnqueueResult.failed("选中历史记录没有可用于 AI 分析的正则命中数据");
+        }
+
+        try {
+            return aiTriageEnqueueService.enqueueAfterRegexPersistence(
+                    messageEntry.getMessageId(),
+                    messageEntry.getContentHash(),
+                    requestResponse,
+                    extractedData,
+                    configLoader.getAiConfig()
+            );
+        } catch (Exception e) {
+            return AiTriageEnqueueService.EnqueueResult.failed(e.getMessage());
+        }
+    }
+
+    String loadAiResultJsonAtModelRow(int modelRow) {
+        if (aiResultRepository == null) {
+            return null;
+        }
+
+        MessageEntry messageEntry;
+        synchronized (pageLog) {
+            if (modelRow < 0 || modelRow >= pageLog.size()) {
+                return null;
+            }
+            messageEntry = pageLog.get(modelRow);
+            if (messageEntry == null || messageEntry.getMessageId() == null || messageEntry.getMessageId().isBlank()) {
+                return null;
+            }
+        }
+        if (messageEntry.getAiTargetSignatureHash() == null || messageEntry.getAiTargetSignatureHash().isBlank()) {
+            return null;
+        }
+        return aiResultRepository.loadAiTriageResultJson(messageEntry.getMessageId(), messageEntry.getAiTargetSignatureHash());
+    }
+
+    private String loadAiDetailText(MessageEntry messageEntry) {
+        if (aiResultRepository == null || messageEntry == null
+                || messageEntry.getMessageId() == null || messageEntry.getMessageId().isBlank()) {
+            return "暂无 AI 结果。";
+        }
+        if (messageEntry.getAiTargetSignatureHash() == null || messageEntry.getAiTargetSignatureHash().isBlank()) {
+            return "请选择左侧具体规则取值查看 AI 详情。";
+        }
+
+        List<SqliteMessageStore.AiTriageResultSummary> summaries = aiResultRepository.loadAiTriageResultSummaries(
+                List.of(messageEntry.getMessageId()),
+                messageEntry.getAiTargetSignatureHash()
+        );
+        if (summaries.isEmpty()) {
+            return "暂无当前规则/取值的 AI 结果。";
+        }
+
+        SqliteMessageStore.AiTriageResultSummary summary = summaries.get(0);
+        String resultJson = aiResultRepository.loadAiTriageResultJson(messageEntry.getMessageId(), messageEntry.getAiTargetSignatureHash());
+        StringBuilder builder = new StringBuilder();
+        builder.append("AI目标：").append(safeDetail(messageEntry.getAiTargetRuleName()))
+                .append(" / ").append(safeDetail(messageEntry.getAiTargetValue())).append('\n');
+        builder.append("AI状态：").append(AiSummaryFormatter.displayAiStatus(summary)).append('\n');
+        builder.append("AI结论：").append(AiSummaryFormatter.displayAiVerdict(summary)).append('\n');
+        builder.append("AI风险：").append(AiSummaryFormatter.displayAiRisk(summary)).append('\n');
+        builder.append("AI置信度：").append(AiSummaryFormatter.formatConfidence(summary.getConfidence())).append('\n');
+        builder.append("模型：").append(safeDetail(summary.getModel())).append('\n');
+        builder.append("摘要：").append(safeDetail(AiSummaryFormatter.displayAiSummary(summary))).append('\n');
+        if (summary.isEmptyAdvisoryResult()) {
+            builder.append('\n').append("提示：AI 返回了空结论。请在 AI 设置中点击“分析选中项”重新分析。").append('\n');
+        } else if (summary.isLowQualityAdvisoryResult()) {
+            builder.append('\n').append("提示：AI 返回了低质量结论（摘要为空、总体置信度为 0，且逐项风险/置信度无有效判断）。请在 AI 设置中点击“分析选中项”重新分析。").append('\n');
+        }
+        if (resultJson != null && !resultJson.isBlank()) {
+            builder.append('\n').append("原始AI结果：").append('\n').append(formatJsonForDisplay(resultJson));
+        }
+        return builder.toString();
+    }
+
+    private static String formatJsonForDisplay(String json) {
+        if (json == null || json.isBlank()) {
+            return "";
+        }
+        StringBuilder formatted = new StringBuilder(json.length() + 64);
+        int indent = 0;
+        boolean inString = false;
+        boolean escaping = false;
+        for (int i = 0; i < json.length(); i++) {
+            char ch = json.charAt(i);
+            if (escaping) {
+                formatted.append(ch);
+                escaping = false;
+                continue;
+            }
+            if (ch == '\\' && inString) {
+                formatted.append(ch);
+                escaping = true;
+                continue;
+            }
+            if (ch == '"') {
+                formatted.append(ch);
+                inString = !inString;
+                continue;
+            }
+            if (inString) {
+                formatted.append(ch);
+                continue;
+            }
+            switch (ch) {
+                case '{', '[' -> {
+                    formatted.append(ch).append('\n');
+                    indent++;
+                    appendIndent(formatted, indent);
+                }
+                case '}', ']' -> {
+                    formatted.append('\n');
+                    indent = Math.max(0, indent - 1);
+                    appendIndent(formatted, indent);
+                    formatted.append(ch);
+                }
+                case ',' -> {
+                    formatted.append(ch).append('\n');
+                    appendIndent(formatted, indent);
+                }
+                case ':' -> formatted.append(": ");
+                default -> {
+                    if (!Character.isWhitespace(ch)) {
+                        formatted.append(ch);
+                    }
+                }
+            }
+        }
+        return formatted.toString();
+    }
+
+    private static void appendIndent(StringBuilder builder, int indent) {
+        for (int i = 0; i < indent; i++) {
+            builder.append("  ");
+        }
+    }
+
+    private static String safeDetail(String value) {
+        return value == null || value.isBlank() ? "-" : value;
     }
 
     @Override
@@ -804,7 +1316,7 @@ public class MessageTableModel extends AbstractTableModel {
 
     @Override
     public int getColumnCount() {
-        return 6;
+        return BASE_COLUMN_COUNT;
     }
 
     @Override
@@ -860,24 +1372,62 @@ public class MessageTableModel extends AbstractTableModel {
             this.requestEditor = requestEditor;
             this.responseEditor = responseEditor;
             this.executorService = Executors.newSingleThreadExecutor();
+            getSelectionModel().addListSelectionListener(event -> {
+                if (!event.getValueIsAdjusting()) {
+                    refreshSelectedMessageAsync();
+                }
+            });
         }
 
         private void shutdown() {
             executorService.shutdownNow();
+            try {
+                if (!executorService.awaitTermination(2, TimeUnit.SECONDS)) {
+                    api.logging().logToError("MessageTable.shutdown: selection executor did not terminate promptly");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                api.logging().logToError("MessageTable.shutdown: interrupted while waiting for selection executor shutdown");
+            }
         }
 
         @Override
         public void changeSelection(int row, int col, boolean toggle, boolean extend) {
             super.changeSelection(row, col, toggle, extend);
-            int selectedIndex = convertRowIndexToModel(row);
+            refreshSelectedMessageAsync();
+        }
+
+        private void refreshSelectedMessageAsync() {
+            if (shutdownRequested.get()) {
+                return;
+            }
+            int selectedRow = getSelectedRow();
+            if (selectedRow < 0) {
+                aiDetailArea.setText("暂无 AI 结果。");
+                return;
+            }
+            int selectedIndex = convertRowIndexToModel(selectedRow);
             if (lastSelectedIndex != selectedIndex) {
                 lastSelectedIndex = selectedIndex;
-                executorService.execute(this::getSelectedMessage);
+                long selectedGeneration = selectionGeneration.incrementAndGet();
+                String selectedMessageId = messageIdAtModelRow(selectedIndex);
+                if (selectedMessageId == null || executorService.isShutdown()) {
+                    return;
+                }
+                try {
+                    executorService.execute(() -> getSelectedMessage(selectedIndex, selectedMessageId, selectedGeneration));
+                } catch (RejectedExecutionException e) {
+                    if (!shutdownRequested.get()) {
+                        api.logging().logToError("refreshSelectedMessageAsync: " + e.getMessage());
+                    }
+                }
             }
         }
 
-        private void getSelectedMessage() {
-            int selectedIndexSnapshot = lastSelectedIndex;
+        private void getSelectedMessage(int selectedIndexSnapshot, String messageIdSnapshot, long generationSnapshot) {
+            if (shutdownRequested.get()) {
+                return;
+            }
             MessageEntry messageEntry;
             synchronized (pageLog) {
                 if (selectedIndexSnapshot < 0 || selectedIndexSnapshot >= pageLog.size()) {
@@ -885,21 +1435,74 @@ public class MessageTableModel extends AbstractTableModel {
                 }
                 messageEntry = pageLog.get(selectedIndexSnapshot);
             }
-
-            HttpRequestResponse httpRequestResponse = messageRepository.loadMessage(messageEntry.getMessageId());
-            if (httpRequestResponse == null) {
+            if (messageEntry == null || !Objects.equals(messageEntry.getMessageId(), messageIdSnapshot)) {
                 return;
             }
 
-            HttpRequest request = HttpRequest.httpRequest(httpRequestResponse.httpService(), httpRequestResponse.request().toByteArray());
-            HttpResponse response = buildDisplayResponse(httpRequestResponse.response());
+            String aiDetailText = loadAiDetailText(messageEntry);
+            HttpRequestResponse httpRequestResponse = messageRepository.loadMessage(messageIdSnapshot);
+            if (httpRequestResponse == null) {
+                SwingUtilities.invokeLater(() -> {
+                    if (!isCurrentSelection(selectedIndexSnapshot, messageIdSnapshot, generationSnapshot)) {
+                        return;
+                    }
+                    aiDetailArea.setText(aiDetailText);
+                    aiDetailArea.setCaretPosition(0);
+                });
+                return;
+            }
+
+            HttpRequest request = null;
+            HttpResponse response = null;
+            try {
+                request = HttpRequest.httpRequest(httpRequestResponse.httpService(), httpRequestResponse.request().toByteArray());
+                response = buildDisplayResponse(httpRequestResponse.response());
+            } catch (Exception e) {
+                api.logging().logToError("getSelectedMessage editors: " + e.getMessage());
+            }
+            HttpRequest displayRequest = request;
+            HttpResponse displayResponse = response;
             SwingUtilities.invokeLater(() -> {
-                if (lastSelectedIndex != selectedIndexSnapshot) {
+                if (!isCurrentSelection(selectedIndexSnapshot, messageIdSnapshot, generationSnapshot)) {
                     return;
                 }
-                requestEditor.setRequest(request);
-                responseEditor.setResponse(response);
+                aiDetailArea.setText(aiDetailText);
+                aiDetailArea.setCaretPosition(0);
+                if (displayRequest != null) {
+                    requestEditor.setRequest(displayRequest);
+                }
+                if (displayResponse != null) {
+                    responseEditor.setResponse(displayResponse);
+                }
             });
+        }
+
+        private String messageIdAtModelRow(int modelRow) {
+            synchronized (pageLog) {
+                if (modelRow < 0 || modelRow >= pageLog.size()) {
+                    return null;
+                }
+                MessageEntry messageEntry = pageLog.get(modelRow);
+                if (messageEntry == null || messageEntry.getMessageId() == null || messageEntry.getMessageId().isBlank()) {
+                    return null;
+                }
+                return messageEntry.getMessageId();
+            }
+        }
+
+        private boolean isCurrentSelection(int selectedIndexSnapshot, String messageIdSnapshot, long generationSnapshot) {
+            if (shutdownRequested.get() || lastSelectedIndex != selectedIndexSnapshot || selectionGeneration.get() != generationSnapshot) {
+                return false;
+            }
+            int currentSelectedRow = getSelectedRow();
+            if (currentSelectedRow < 0) {
+                return false;
+            }
+            int currentModelRow = convertRowIndexToModel(currentSelectedRow);
+            if (currentModelRow != selectedIndexSnapshot) {
+                return false;
+            }
+            return Objects.equals(messageIdAtModelRow(currentModelRow), messageIdSnapshot);
         }
 
         private HttpResponse buildDisplayResponse(HttpResponse response) {
