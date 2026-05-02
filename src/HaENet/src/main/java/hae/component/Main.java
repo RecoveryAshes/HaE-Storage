@@ -2,6 +2,7 @@ package hae.component;
 
 import burp.api.montoya.MontoyaApi;
 import hae.component.board.Databoard;
+import hae.component.board.DataboardAiSettingsController;
 import hae.component.board.message.MessageTableModel;
 import hae.component.rule.Rules;
 import hae.utils.ConfigLoader;
@@ -17,11 +18,20 @@ public class Main extends JPanel {
     private final MontoyaApi api;
     private final ConfigLoader configLoader;
     private final MessageTableModel messageTableModel;
+    private final DataboardAiSettingsController.WorkerControls aiWorkerControls;
 
     public Main(MontoyaApi api, ConfigLoader configLoader, MessageTableModel messageTableModel) {
+        this(api, configLoader, messageTableModel, null);
+    }
+
+    public Main(MontoyaApi api,
+                ConfigLoader configLoader,
+                MessageTableModel messageTableModel,
+                DataboardAiSettingsController.WorkerControls aiWorkerControls) {
         this.api = api;
         this.configLoader = configLoader;
         this.messageTableModel = messageTableModel;
+        this.aiWorkerControls = aiWorkerControls;
 
         initComponents();
     }
@@ -57,8 +67,8 @@ public class Main extends JPanel {
         // 依次添加Rules、Config、Databoard
         Rules rules = new Rules(api, configLoader);
         mainTabbedPane.addTab("Rules", rules);
-        mainTabbedPane.addTab("Databoard", new Databoard(api, configLoader, messageTableModel));
-        mainTabbedPane.addTab("Config", new Config(api, configLoader, messageTableModel, rules));
+        mainTabbedPane.addTab("Databoard", new Databoard(api, configLoader, messageTableModel, aiWorkerControls));
+        mainTabbedPane.addTab("Config", new Config(api, configLoader, messageTableModel, rules, aiWorkerControls));
     }
 
     private ImageIcon getImageIcon(boolean isDark) {

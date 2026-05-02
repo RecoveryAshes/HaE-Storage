@@ -5,6 +5,8 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
 import burp.api.montoya.core.BurpSuiteEdition;
 import burp.api.montoya.logging.Logging;
+import hae.ai.AiTriageLifecycle;
+import hae.component.board.DataboardAiSettingsController;
 import hae.cache.DataCache;
 import hae.component.Main;
 import hae.component.board.message.MessageTableModel;
@@ -45,6 +47,8 @@ public class HaE implements BurpExtension {
         ConfigLoader configLoader = new ConfigLoader(api);
 
         SqliteMessageStore messageStore = new SqliteMessageStore(api, configLoader);
+        AiTriageLifecycle aiTriageLifecycle = AiTriageLifecycle.startIfEnabled(api, configLoader, messageStore);
+        DataboardAiSettingsController.WorkerControls aiWorkerControls = DataboardAiSettingsController.workerControls(aiTriageLifecycle);
         MessageTableModel messageTableModel = new MessageTableModel(
                 api,
                 configLoader,
@@ -58,7 +62,7 @@ public class HaE implements BurpExtension {
         Config.proVersionStatus = getBurpSuiteProStatus(api);
 
         // 注册Tab页（用于查询数据）
-        api.userInterface().registerSuiteTab("HaE", new Main(api, configLoader, messageTableModel));
+        api.userInterface().registerSuiteTab("HaE", new Main(api, configLoader, messageTableModel, aiWorkerControls));
 
         // 注册右键菜单（用于基于选中的 HTTP 消息打开 Scoped Databoard）
         registerDataboardContextMenu(api, configLoader, messageStore);
@@ -79,6 +83,11 @@ public class HaE implements BurpExtension {
         Runnable cleanupTask = () -> {
             if (!cleanupExecuted.compareAndSet(false, true)) {
                 return;
+            }
+
+            try {
+                aiTriageLifecycle.shutdown();
+            } catch (Exception ignored) {
             }
 
             // 关闭Burp时清空所有数据（SQLite / PersistedData / 内存缓存）
