@@ -1,6 +1,7 @@
 package hae.component.board.table;
 
 import burp.api.montoya.MontoyaApi;
+import hae.component.board.message.AiSummaryDisplay;
 import hae.component.board.message.MessageTableModel;
 import hae.utils.ConfigLoader;
 import hae.utils.UIEnhancer;
@@ -23,8 +24,24 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 public class Datatable extends JPanel {
+    private static final int INFORMATION_COLUMN = 1;
+    private static final int AI_STATUS_COLUMN = 2;
+    private static final int AI_VERDICT_COLUMN = 3;
+    private static final int AI_CONFIDENCE_COLUMN = 4;
+    private static final int INFORMATION_MIN_WIDTH = 260;
+    private static final int INFORMATION_PREFERRED_WIDTH = 760;
+    private static final int MEASURED_COLUMN_PADDING = 28;
+    private static final int ID_PREFERRED_WIDTH = 52;
+    private static final int AI_STATUS_PREFERRED_WIDTH = 112;
+    private static final int AI_VERDICT_PREFERRED_WIDTH = 140;
+    private static final int AI_CONFIDENCE_PREFERRED_WIDTH = 122;
+
     public interface TableFilterListener {
         void applyMessageFilter(String tableName, String filterText);
+    }
+
+    public interface AiSummaryProvider {
+        AiSummaryDisplay aiSummaryFor(String ruleName, String value);
     }
 
     private final JTable dataTable;
@@ -37,13 +54,20 @@ public class Datatable extends JPanel {
     private final JLabel statusLabel;
     private final String tabName;
     private final JPanel footerPanel;
+    private AiSummaryProvider aiSummaryProvider;
     private SwingWorker<Void, Void> doubleClickWorker;
     private boolean invalidRegexActive;
+    private TableFilterListener tableFilterListener;
 
     public Datatable(MontoyaApi api, ConfigLoader configLoader, String tabName, List<String> dataList) {
-        this.tabName = tabName;
+        this(api, configLoader, tabName, dataList, null);
+    }
 
-        String[] columnNames = {"#", "Information"};
+    public Datatable(MontoyaApi api, ConfigLoader configLoader, String tabName, List<String> dataList, AiSummaryProvider aiSummaryProvider) {
+        this.tabName = tabName;
+        this.aiSummaryProvider = aiSummaryProvider == null ? (ruleName, value) -> AiSummaryDisplay.empty() : aiSummaryProvider;
+
+        String[] columnNames = {"#", "Information", "AI状态", "AI结论", "AI置信度"};
         this.dataTableModel = new DefaultTableModel(columnNames, 0);
 
         this.dataTable = new JTable(dataTableModel);
@@ -70,7 +94,7 @@ public class Datatable extends JPanel {
 
         for (String item : dataList) {
             if (!item.isEmpty()) {
-                addRowToTable(new Object[]{item});
+                addRowToTable(item);
             }
         }
 
@@ -116,9 +140,7 @@ public class Datatable extends JPanel {
         JScrollPane scrollPane = new JScrollPane(dataTable);
         scrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
 
-        TableColumn idColumn = dataTable.getColumnModel().getColumn(0);
-        idColumn.setPreferredWidth(50);
-        idColumn.setMaxWidth(100);
+        configureColumnWidths();
 
         setLayout(new BorderLayout(0, 5));
 
@@ -152,6 +174,7 @@ public class Datatable extends JPanel {
         dataTable.getSelectionModel().addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
                 updateStatusLabel();
+                notifySelectedValue();
             }
         });
 
@@ -171,13 +194,90 @@ public class Datatable extends JPanel {
     }
 
 
-    private void addRowToTable(Object[] data) {
+    private void addRowToTable(String value) {
         int rowCount = dataTableModel.getRowCount();
         int id = rowCount > 0 ? (Integer) dataTableModel.getValueAt(rowCount - 1, 0) + 1 : 1;
-        Object[] rowData = new Object[data.length + 1];
-        rowData[0] = id;
-        System.arraycopy(data, 0, rowData, 1, data.length);
+        AiSummaryDisplay aiSummary = loadAiSummary(value);
+        Object[] rowData = new Object[]{
+                id,
+                value,
+                aiSummary.getAiStatus(),
+                aiSummary.getAiVerdict(),
+                aiSummary.getAiConfidence()
+        };
         dataTableModel.addRow(rowData);
+    }
+
+    private AiSummaryDisplay loadAiSummary(String value) {
+        try {
+            AiSummaryDisplay aiSummary = aiSummaryProvider.aiSummaryFor(tabName, value);
+            return aiSummary == null ? AiSummaryDisplay.empty() : aiSummary;
+        } catch (RuntimeException e) {
+            return AiSummaryDisplay.empty();
+        }
+    }
+
+    private void configureColumnWidths() {
+        dataTable.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
+
+        configureMeasuredPreferredWidthColumn(0, ID_PREFERRED_WIDTH);
+
+        TableColumn informationColumn = dataTable.getColumnModel().getColumn(INFORMATION_COLUMN);
+        informationColumn.setMinWidth(INFORMATION_MIN_WIDTH);
+        informationColumn.setPreferredWidth(INFORMATION_PREFERRED_WIDTH);
+        informationColumn.setMaxWidth(Integer.MAX_VALUE);
+        informationColumn.setResizable(true);
+
+        configureMeasuredPreferredWidthColumn(AI_STATUS_COLUMN, AI_STATUS_PREFERRED_WIDTH);
+        configureMeasuredPreferredWidthColumn(AI_VERDICT_COLUMN, AI_VERDICT_PREFERRED_WIDTH);
+        configureMeasuredPreferredWidthColumn(AI_CONFIDENCE_COLUMN, AI_CONFIDENCE_PREFERRED_WIDTH);
+    }
+
+    private void configureMeasuredPreferredWidthColumn(int columnIndex, int preferredWidthFloor) {
+        int width = Math.max(measuredColumnWidth(columnIndex), preferredWidthFloor);
+        TableColumn column = dataTable.getColumnModel().getColumn(columnIndex);
+        column.setPreferredWidth(width);
+        column.setResizable(true);
+    }
+
+    private int measuredColumnWidth(int columnIndex) {
+        int width = textWidth(dataTable.getColumnName(columnIndex), dataTable.getTableHeader().getFontMetrics(dataTable.getTableHeader().getFont()));
+        FontMetrics cellMetrics = dataTable.getFontMetrics(dataTable.getFont());
+        for (int row = 0; row < dataTableModel.getRowCount(); row++) {
+            Object value = dataTableModel.getValueAt(row, columnIndex);
+            width = Math.max(width, textWidth(value == null ? "" : value.toString(), cellMetrics));
+        }
+        return width + MEASURED_COLUMN_PADDING;
+    }
+
+    private int textWidth(String text, FontMetrics metrics) {
+        return metrics.stringWidth(text == null ? "" : text);
+    }
+
+    public List<String> getInformationValues() {
+        List<String> values = new ArrayList<>(dataTableModel.getRowCount());
+        for (int row = 0; row < dataTableModel.getRowCount(); row++) {
+            Object value = dataTableModel.getValueAt(row, INFORMATION_COLUMN);
+            if (value != null) {
+                values.add(value.toString());
+            }
+        }
+        return values;
+    }
+
+    public void refreshAiSummaries(AiSummaryProvider aiSummaryProvider) {
+        if (aiSummaryProvider != null) {
+            this.aiSummaryProvider = aiSummaryProvider;
+        }
+        for (int row = 0; row < dataTableModel.getRowCount(); row++) {
+            Object value = dataTableModel.getValueAt(row, INFORMATION_COLUMN);
+            AiSummaryDisplay aiSummary = loadAiSummary(value == null ? "" : value.toString());
+            dataTableModel.setValueAt(aiSummary.getAiStatus(), row, AI_STATUS_COLUMN);
+            dataTableModel.setValueAt(aiSummary.getAiVerdict(), row, AI_VERDICT_COLUMN);
+            dataTableModel.setValueAt(aiSummary.getAiConfidence(), row, AI_CONFIDENCE_COLUMN);
+        }
+        dataTable.revalidate();
+        dataTable.repaint();
     }
 
     private void performSearch() {
@@ -218,7 +318,7 @@ public class Datatable extends JPanel {
             Pattern finalPattern = pattern;
             return new RowFilter<>() {
                 public boolean include(Entry<?, ?> entry) {
-                    String entryValue = ((String) entry.getValue(1)).toLowerCase();
+                    String entryValue = ((String) entry.getValue(INFORMATION_COLUMN)).toLowerCase();
                     return finalPattern.matcher(entryValue).find() != firstFlagReturn;
                 }
             };
@@ -226,7 +326,7 @@ public class Datatable extends JPanel {
 
         return new RowFilter<>() {
             public boolean include(Entry<?, ?> entry) {
-                String entryValue = ((String) entry.getValue(1)).toLowerCase();
+                String entryValue = ((String) entry.getValue(INFORMATION_COLUMN)).toLowerCase();
                 return entryValue.contains(searchFieldTextText) != firstFlagReturn;
             }
         };
@@ -267,7 +367,7 @@ public class Datatable extends JPanel {
         doubleClickWorker = new SwingWorker<>() {
             @Override
             protected Void doInBackground() {
-                String rowData = dataTable.getValueAt(selectedRow, 1).toString();
+                String rowData = dataTable.getValueAt(selectedRow, INFORMATION_COLUMN).toString();
                 SwingUtilities.invokeLater(() -> {
                     if (!isCancelled()) {
                         messagePanel.applyMessageFilter(tabName, rowData);
@@ -279,6 +379,21 @@ public class Datatable extends JPanel {
         doubleClickWorker.execute();
     }
 
+    private void notifySelectedValue() {
+        if (tableFilterListener == null) {
+            return;
+        }
+        int selectedRow = dataTable.getSelectedRow();
+        if (selectedRow < 0) {
+            return;
+        }
+        Object value = dataTable.getValueAt(selectedRow, INFORMATION_COLUMN);
+        if (value == null) {
+            return;
+        }
+        tableFilterListener.applyMessageFilter(tabName, value.toString());
+    }
+
     public void setTableListener(MessageTableModel messagePanel) {
         setTableListener((tableName, filterText) -> messagePanel.applyMessageFilter(tableName, filterText));
     }
@@ -287,6 +402,7 @@ public class Datatable extends JPanel {
         if (messagePanel == null) {
             return;
         }
+        this.tableFilterListener = messagePanel;
 
         // 表格复制功能
         dataTable.setTransferHandler(new TransferHandler() {
@@ -322,7 +438,7 @@ public class Datatable extends JPanel {
         StringBuilder selectData = new StringBuilder();
 
         for (int row : selectRows) {
-            selectData.append(table.getValueAt(row, 1).toString()).append("\r\n");
+            selectData.append(table.getValueAt(row, INFORMATION_COLUMN).toString()).append("\r\n");
         }
 
         if (!selectData.isEmpty()) {

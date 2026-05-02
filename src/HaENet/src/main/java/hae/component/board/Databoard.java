@@ -1,10 +1,13 @@
 package hae.component.board;
 
 import burp.api.montoya.MontoyaApi;
+import hae.ai.AiConfig;
 import hae.cache.DataCache;
+import hae.component.board.message.AiSummaryDisplay;
 import hae.component.board.message.MessageTableModel;
 import hae.component.board.message.MessageTableModel.MessageTable;
 import hae.component.board.table.Datatable;
+import hae.repository.AiTaskRepository;
 import hae.utils.ConfigLoader;
 import hae.utils.UIEnhancer;
 import hae.utils.string.StringProcessor;
@@ -24,6 +27,7 @@ public class Databoard extends JPanel {
     private final MontoyaApi api;
     private final ConfigLoader configLoader;
     private final MessageTableModel messageTableModel;
+    private final DataboardAiSettingsController.WorkerControls aiWorkerControls;
     private final DefaultComboBoxModel<String> comboBoxModel = new DefaultComboBoxModel<>();
     private final JComboBox<String> hostComboBox = new JComboBox<>(comboBoxModel);
     private JTextField hostTextField;
@@ -31,17 +35,29 @@ public class Databoard extends JPanel {
     private JSplitPane splitPane;
     private MessageTable messageTable;
     private JProgressBar progressBar;
-    private SwingWorker<Map<String, List<String>>, Integer> handleComboBoxWorker;
+    private JLabel aiStatusLabel;
+    private JButton aiSettingsToolbarButton;
+    private SwingWorker<DataLoadingResult, Integer> handleComboBoxWorker;
     private SwingWorker<Void, Void> applyHostFilterWorker;
     private SwingWorker<List<String>, Void> hostListWorker;
+    private SwingWorker<Map<String, AiSummaryDisplay>, Void> aiSummaryRefreshWorker;
     private List<String> cachedHostList = new ArrayList<>();
     private long cachedHostListAt = 0L;
+    private String activeHostFilter = "*";
     private static final long HOST_LIST_CACHE_TTL_MILLIS = 3000L;
 
     public Databoard(MontoyaApi api, ConfigLoader configLoader, MessageTableModel messageTableModel) {
+        this(api, configLoader, messageTableModel, null);
+    }
+
+    public Databoard(MontoyaApi api,
+                     ConfigLoader configLoader,
+                     MessageTableModel messageTableModel,
+                     DataboardAiSettingsController.WorkerControls aiWorkerControls) {
         this.api = api;
         this.configLoader = configLoader;
         this.messageTableModel = messageTableModel;
+        this.aiWorkerControls = aiWorkerControls;
 
         initComponents();
     }
@@ -57,13 +73,21 @@ public class Databoard extends JPanel {
         JButton clearDataButton = new JButton("Clear data");
         JButton clearCacheButton = new JButton("Clear cache");
         JButton clearStorageButton = new JButton("Clear storage");
+        JButton aiSettingsButton = new JButton("AI 设置");
+        aiSettingsToolbarButton = new JButton("AI 设置");
         JButton actionButton = new JButton("Action");
-        JPanel menuPanel = new JPanel(new GridLayout(3, 1, 0, 5));
+        aiStatusLabel = new JLabel();
+        JPanel actionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        actionPanel.add(actionButton);
+        actionPanel.add(aiStatusLabel);
+        actionPanel.add(aiSettingsToolbarButton);
+        JPanel menuPanel = new JPanel(new GridLayout(4, 1, 0, 5));
         menuPanel.setBorder(BorderFactory.createEmptyBorder(3, 3, 3, 3));
         JPopupMenu menu = new JPopupMenu();
         menuPanel.add(clearDataButton);
         menuPanel.add(clearCacheButton);
         menuPanel.add(clearStorageButton);
+        menuPanel.add(aiSettingsButton);
         menu.add(menuPanel);
 
         hostTextField = new JTextField();
@@ -81,7 +105,9 @@ public class Databoard extends JPanel {
                 selectedTitle = dataTabbedPane.getTitleAt(selectedIndex);
             }
 
-            messageTableModel.applyCommentFilter(StringProcessor.extractItemName(selectedTitle));
+            String ruleName = StringProcessor.extractItemName(selectedTitle);
+            refreshSelectedRuleAiSummaries(ruleName);
+            messageTableModel.applyCommentFilter(ruleName);
         });
 
         actionButton.addActionListener(e -> {
@@ -93,6 +119,8 @@ public class Databoard extends JPanel {
         clearDataButton.addActionListener(this::clearDataActionPerformed);
         clearCacheButton.addActionListener(this::clearCacheActionPerformed);
         clearStorageButton.addActionListener(this::clearStorageActionPerformed);
+        aiSettingsButton.addActionListener(this::aiSettingsActionPerformed);
+        aiSettingsToolbarButton.addActionListener(this::aiSettingsActionPerformed);
 
         progressBar = new JProgressBar();
         splitPane.addComponentListener(new ComponentAdapter() {
@@ -109,25 +137,29 @@ public class Databoard extends JPanel {
                 new Insets(8, 0, 5, 5), 0, 0));
         add(hostTextField, new GridBagConstraints(2, 0, 1, 1, 0.0, 0.0, GridBagConstraints.CENTER, GridBagConstraints.BOTH,
                 new Insets(8, 0, 5, 5), 0, 0));
-        add(actionButton, new GridBagConstraints(3, 0, 1, 1, 0.0, 0.0, GridBagConstraints.CENTER, GridBagConstraints.BOTH,
+        add(actionPanel, new GridBagConstraints(3, 0, 2, 1, 0.0, 0.0, GridBagConstraints.CENTER, GridBagConstraints.BOTH,
                 new Insets(8, 0, 5, 5), 0, 0));
 
-        add(splitPane, new GridBagConstraints(1, 1, 3, 1, 0.0, 1.0,
+        add(splitPane, new GridBagConstraints(1, 1, 4, 1, 1.0, 1.0,
                 GridBagConstraints.CENTER, GridBagConstraints.BOTH,
                 new Insets(0, 5, 0, 5), 0, 0));
-        add(progressBar, new GridBagConstraints(1, 2, 3, 1, 1.0, 0.0,
+        add(progressBar, new GridBagConstraints(1, 2, 4, 1, 1.0, 0.0,
                 GridBagConstraints.CENTER, GridBagConstraints.HORIZONTAL,
                 new Insets(0, 5, 0, 5), 0, 0));
         hostComboBox.setMaximumRowCount(5);
         add(hostComboBox, new GridBagConstraints(2, 0, 1, 1, 0.0, 0.0, GridBagConstraints.CENTER, GridBagConstraints.BOTH,
                 new Insets(8, 0, 5, 5), 0, 0));
 
+        refreshAiStatusLabel();
         setAutoMatch();
     }
 
     private void resizePanel() {
         splitPane.setDividerLocation(0.4);
         TableColumnModel columnModel = messageTable.getColumnModel();
+        if (columnModel.getColumnCount() < 6) {
+            return;
+        }
         int totalWidth = (int) (getWidth() * 0.6);
         columnModel.getColumn(0).setPreferredWidth((int) (totalWidth * 0.1));
         columnModel.getColumn(1).setPreferredWidth((int) (totalWidth * 0.3));
@@ -232,8 +264,31 @@ public class Databoard extends JPanel {
         return messageTableModel.getRowCount();
     }
 
+    Datatable getDataTabComponentForTest(int index) {
+        Component component = dataTabbedPane.getComponentAt(index);
+        return component instanceof Datatable datatable ? datatable : null;
+    }
+
+    void selectDataTabForTest(int index) {
+        dataTabbedPane.setSelectedIndex(index);
+        String title = dataTabbedPane.getTitleAt(index);
+        refreshSelectedRuleAiSummaries(StringProcessor.extractItemName(title));
+    }
+
     JTextField getHostTextFieldForTest() {
         return hostTextField;
+    }
+
+    String getAiStatusTextForTest() {
+        return aiStatusLabel == null ? "" : aiStatusLabel.getText();
+    }
+
+    boolean isAiSettingsToolbarVisibleForTest() {
+        return aiSettingsToolbarButton != null && aiSettingsToolbarButton.isVisible();
+    }
+
+    GridBagConstraints getMainSplitPaneConstraintsForTest() {
+        return ((GridBagLayout) getLayout()).getConstraints(splitPane);
     }
 
     private void loadHostFromInput() {
@@ -251,17 +306,68 @@ public class Databoard extends JPanel {
             handleComboBoxWorker.cancel(true);
         }
 
+        activeHostFilter = (selectedHost == null || selectedHost.trim().isEmpty()) ? "*" : selectedHost.trim();
+
         handleComboBoxWorker = new DataLoadingWorker(selectedHost);
         handleComboBoxWorker.execute();
     }
 
-    private Map<String, List<String>> getSelectedMapByHost(String selectedHost, DataLoadingWorker worker) {
+    private void refreshSelectedRuleAiSummaries(String ruleName) {
+        if (ruleName == null || ruleName.isBlank() || dataTabbedPane == null) {
+            return;
+        }
+        int selectedIndex = dataTabbedPane.getSelectedIndex();
+        if (selectedIndex < 0) {
+            return;
+        }
+        Component selectedComponent = dataTabbedPane.getComponentAt(selectedIndex);
+        if (!(selectedComponent instanceof Datatable datatable)) {
+            return;
+        }
+        List<String> values = datatable.getInformationValues();
+        if (values.isEmpty()) {
+            return;
+        }
+        if (aiSummaryRefreshWorker != null && !aiSummaryRefreshWorker.isDone()) {
+            aiSummaryRefreshWorker.cancel(true);
+        }
+        String hostFilter = activeHostFilter;
+        Map<String, List<String>> requestedRuleValues = Map.of(ruleName, values);
+        aiSummaryRefreshWorker = new SwingWorker<>() {
+            @Override
+            protected Map<String, AiSummaryDisplay> doInBackground() {
+                Map<String, Map<String, AiSummaryDisplay>> summariesByRule = messageTableModel.loadAiSummariesByRuleValue(hostFilter, requestedRuleValues);
+                return summariesByRule.getOrDefault(ruleName, Collections.emptyMap());
+            }
+
+            @Override
+            protected void done() {
+                if (isCancelled()) {
+                    return;
+                }
+                try {
+                    Map<String, AiSummaryDisplay> summariesByValue = get();
+                    datatable.refreshAiSummaries((targetRuleName, value) -> summariesByValue.getOrDefault(value, AiSummaryDisplay.empty()));
+                } catch (Exception e) {
+                    api.logging().logToOutput("refreshSelectedRuleAiSummaries: " + e.getMessage());
+                }
+            }
+        };
+        aiSummaryRefreshWorker.execute();
+    }
+
+    private DataLoadingResult getSelectedMapByHost(String selectedHost, DataLoadingWorker worker) {
         Map<String, List<String>> selectedDataMap = messageTableModel.loadExtractedDataByHost(selectedHost);
+        if (worker != null) {
+            worker.publishProgress(70);
+        }
+        Map<String, List<String>> extractedDataByRule = selectedDataMap != null ? selectedDataMap : new HashMap<>();
+        Map<String, Map<String, AiSummaryDisplay>> aiSummariesByRuleValue = messageTableModel.loadAiSummariesByRuleValue(selectedHost, extractedDataByRule);
         if (worker != null) {
             worker.publishProgress(90);
         }
 
-        return selectedDataMap != null ? selectedDataMap : new HashMap<>();
+        return new DataLoadingResult(extractedDataByRule, aiSummariesByRuleValue);
     }
 
     private void filterComboBoxList() {
@@ -384,8 +490,70 @@ public class Databoard extends JPanel {
         }
     }
 
+    private void aiSettingsActionPerformed(ActionEvent e) {
+        AiTaskRepository aiTaskRepository = messageTableModel.getAiTaskRepositoryForSettings();
+        DataboardAiSettingsController controller = new DataboardAiSettingsController(
+                configLoader,
+                aiTaskRepository,
+                aiWorkerControls,
+                messageTableModel,
+                null
+        );
+        DataboardAiSettingsPanel settingsPanel = new DataboardAiSettingsPanel(controller);
+        JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(this), "AI 设置与队列控制", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+        dialog.setContentPane(settingsPanel);
+        dialog.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosed(WindowEvent e) {
+                controller.shutdown();
+            }
+        });
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+        refreshAiStatusLabel();
+    }
+
+    private void refreshAiStatusLabel() {
+        if (aiStatusLabel == null) {
+            return;
+        }
+
+        String statusText = "AI：" + aiEnabledStatus();
+        String workerSummary = aiWorkerStatusSummary();
+        aiStatusLabel.setText(statusText);
+        aiStatusLabel.setToolTipText(workerSummary.isBlank()
+                ? "AI 分析设置与队列控制"
+                : workerSummary);
+    }
+
+    private String aiEnabledStatus() {
+        try {
+            AiConfig aiConfig = configLoader.getAiConfig();
+            return aiConfig.isEnabled() ? "已启用" : "未启用";
+        } catch (RuntimeException e) {
+            return "配置异常";
+        }
+    }
+
+    private String aiWorkerStatusSummary() {
+        if (aiWorkerControls == null) {
+            return "AI worker 控制不可用";
+        }
+        try {
+            return aiWorkerControls.statusSummary();
+        } catch (RuntimeException e) {
+            return "AI worker 状态不可用";
+        }
+    }
+
     // 定义为内部类
-    private class DataLoadingWorker extends SwingWorker<Map<String, List<String>>, Integer> {
+    private record DataLoadingResult(Map<String, List<String>> extractedDataByRule,
+                                     Map<String, Map<String, AiSummaryDisplay>> aiSummariesByRuleValue) {
+    }
+
+    private class DataLoadingWorker extends SwingWorker<DataLoadingResult, Integer> {
         private final String selectedHost;
 
         public DataLoadingWorker(String selectedHost) {
@@ -394,7 +562,7 @@ public class Databoard extends JPanel {
         }
 
         @Override
-        protected Map<String, List<String>> doInBackground() throws Exception {
+        protected DataLoadingResult doInBackground() throws Exception {
             return getSelectedMapByHost(selectedHost, this);
         }
 
@@ -410,13 +578,18 @@ public class Databoard extends JPanel {
         protected void done() {
             if (!isCancelled()) {
                 try {
-                    Map<String, List<String>> selectedDataMap = get();
+                    DataLoadingResult result = get();
+                    Map<String, List<String>> selectedDataMap = result == null ? Collections.emptyMap() : result.extractedDataByRule();
+                    Map<String, Map<String, AiSummaryDisplay>> aiSummariesByRuleValue = result == null ? Collections.emptyMap() : result.aiSummariesByRuleValue();
                     if (selectedDataMap != null && !selectedDataMap.isEmpty()) {
                         dataTabbedPane.removeAll();
 
                         for (Map.Entry<String, List<String>> entry : selectedDataMap.entrySet()) {
+                            String ruleName = entry.getKey();
                             String tabTitle = String.format("%s (%s)", entry.getKey(), entry.getValue().size());
-                            Datatable datatablePanel = new Datatable(api, configLoader, entry.getKey(), entry.getValue());
+                            Map<String, AiSummaryDisplay> summariesByValue = aiSummariesByRuleValue.getOrDefault(ruleName, Collections.emptyMap());
+                            Datatable datatablePanel = new Datatable(api, configLoader, ruleName, entry.getValue(),
+                                    (targetRuleName, value) -> summariesByValue.getOrDefault(value, AiSummaryDisplay.empty()));
                             datatablePanel.setTableListener(messageTableModel);
                             insertTabSorted(dataTabbedPane, tabTitle, datatablePanel);
                         }

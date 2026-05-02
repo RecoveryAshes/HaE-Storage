@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.awt.GridBagConstraints;
 import java.util.concurrent.locks.LockSupport;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
@@ -72,6 +73,48 @@ class DataboardHostSearchTest {
                     () -> assertTrue(databoard.isSplitPaneVisibleForTest()),
                     () -> assertEquals(1, databoard.getDataTabCountForTest()),
                     () -> assertEquals(1, databoard.getMessageTableRowCountForTest())
+            );
+        } finally {
+            model.clearAllDataOnShutdown();
+        }
+    }
+
+    @Test
+    void aiSettingsEntryIsVisibleBeforeLoadingHostData() throws Exception {
+        BoardContext context = createBoardContext(tempDirectory.resolve("ai-entry-visible"));
+        MessageTableModel model = newTestModel(context);
+        try {
+            AtomicReference<Databoard> databoardReference = new AtomicReference<>();
+            onEdt(() -> databoardReference.set(new Databoard(context.api(), context.configLoader(), model)));
+            Databoard databoard = databoardReference.get();
+
+            assertAll(
+                    () -> assertTrue(databoard.isAiSettingsToolbarVisibleForTest()),
+                    () -> assertEquals("AI：未启用", databoard.getAiStatusTextForTest()),
+                    () -> assertEquals(0, databoard.getDataTabCountForTest())
+            );
+        } finally {
+            model.clearAllDataOnShutdown();
+        }
+    }
+
+    @Test
+    void mainSplitPaneExpandsAcrossRightSideOfDataboard() throws Exception {
+        BoardContext context = createBoardContext(tempDirectory.resolve("main-split-layout"));
+        MessageTableModel model = newTestModel(context);
+        try {
+            AtomicReference<Databoard> databoardReference = new AtomicReference<>();
+            onEdt(() -> databoardReference.set(new Databoard(context.api(), context.configLoader(), model)));
+            Databoard databoard = databoardReference.get();
+            GridBagConstraints constraints = databoard.getMainSplitPaneConstraintsForTest();
+
+            assertAll(
+                    () -> assertEquals(1, constraints.gridx),
+                    () -> assertEquals(1, constraints.gridy),
+                    () -> assertEquals(4, constraints.gridwidth),
+                    () -> assertEquals(GridBagConstraints.BOTH, constraints.fill),
+                    () -> assertEquals(1.0, constraints.weightx),
+                    () -> assertEquals(1.0, constraints.weighty)
             );
         } finally {
             model.clearAllDataOnShutdown();
