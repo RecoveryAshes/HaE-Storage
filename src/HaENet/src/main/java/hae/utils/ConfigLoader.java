@@ -2,6 +2,8 @@ package hae.utils;
 
 import burp.api.montoya.MontoyaApi;
 import hae.Config;
+import hae.ai.AiConfig;
+import hae.ai.AiWhitelistRule;
 import org.yaml.snakeyaml.DumperOptions;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
@@ -99,6 +101,28 @@ public class ConfigLoader {
         r.put("LimitSize", getLimitSize());
         r.put("HaEScope", getScope());
         r.put("DynamicHeader", getDynamicHeader());
+        r.put("AIEnabled", getAIEnabled());
+        r.put("AIUseBurpProxy", getAIUseBurpProxy());
+        r.put("AIProviderType", getAIProviderType());
+        r.put("AIBaseUrl", getAIBaseUrl());
+        r.put("AIModel", getAIModel());
+        r.put("AIApiKey", getAIApiKey());
+        r.put("AIRequestTimeoutSeconds", getAIRequestTimeoutSeconds());
+        r.put("AIConcurrency", getAIConcurrency());
+        r.put("AIMaxConcurrency", getAIMaxConcurrency());
+        r.put("AIMaxInFlightChars", getAIMaxInFlightChars());
+        r.put("AIMaxTotalChars", getAIMaxTotalChars());
+        r.put("AIMaxRequestChars", getAIMaxRequestChars());
+        r.put("AIMaxResponseChars", getAIMaxResponseChars());
+        r.put("AIMaxItemsPerMessage", getAIMaxItemsPerMessage());
+        r.put("AIAnalyzeOncePerMessage", getAIAnalyzeOncePerMessage());
+        r.put("AISendFullRequest", getAISendFullRequest());
+        r.put("AISendFullResponse", getAISendFullResponse());
+        r.put("AISkipBinary", getAISkipBinary());
+        r.put("AISkipStaticResources", getAISkipStaticResources());
+        r.put("AIMaxQueueSize", getAIMaxQueueSize());
+        r.put("AISaveFullPrompt", getAISaveFullPrompt());
+        r.put("AIWhitelist", getAIWhitelistConfig());
 
         try {
             Writer ws = new OutputStreamWriter(Files.newOutputStream(Paths.get(configFilePath)), StandardCharsets.UTF_8);
@@ -206,17 +230,268 @@ public class ConfigLoader {
         setValueToConfig("HaEModeStatus", mode);
     }
 
+    public AiConfig getAiConfig() {
+        return new AiConfig(
+                getAIEnabled(),
+                getAIUseBurpProxy(),
+                getAIProviderType(),
+                getAIBaseUrl(),
+                getAIModel(),
+                getAIApiKey(),
+                getAIRequestTimeoutSeconds(),
+                getAIConcurrency(),
+                getAIMaxConcurrency(),
+                getAIMaxInFlightChars(),
+                getAIMaxTotalChars(),
+                getAIMaxRequestChars(),
+                getAIMaxResponseChars(),
+                getAIMaxItemsPerMessage(),
+                getAIAnalyzeOncePerMessage(),
+                getAISendFullRequest(),
+                getAISendFullResponse(),
+                getAISkipBinary(),
+                getAISkipStaticResources(),
+                getAIMaxQueueSize(),
+                getAISaveFullPrompt(),
+                getAIWhitelist()
+        );
+    }
+
+    public boolean getAIEnabled() {
+        return getBooleanFromConfig("AIEnabled", Config.AIEnabled);
+    }
+
+    public void setAIEnabled(boolean enabled) {
+        setValueToConfig("AIEnabled", enabled);
+    }
+
+    public boolean getAIUseBurpProxy() {
+        return getBooleanFromConfig("AIUseBurpProxy", Config.AIUseBurpProxy);
+    }
+
+    public void setAIUseBurpProxy(boolean useBurpProxy) {
+        setValueToConfig("AIUseBurpProxy", useBurpProxy);
+    }
+
+    public String getAIProviderType() {
+        return getValueFromConfig("AIProviderType", Config.AIProviderType);
+    }
+
+    public void setAIProviderType(String providerType) {
+        setValueToConfig("AIProviderType", providerType);
+    }
+
+    public String getAIBaseUrl() {
+        return getValueFromConfig("AIBaseUrl", Config.AIBaseUrl);
+    }
+
+    public void setAIBaseUrl(String baseUrl) {
+        setValueToConfig("AIBaseUrl", baseUrl);
+    }
+
+    public String getAIModel() {
+        return getValueFromConfig("AIModel", Config.AIModel);
+    }
+
+    public void setAIModel(String model) {
+        setValueToConfig("AIModel", model);
+    }
+
+    public String getAIApiKey() {
+        return getValueFromConfig("AIApiKey", Config.AIApiKey);
+    }
+
+    public void setAIApiKey(String apiKey) {
+        setValueToConfig("AIApiKey", apiKey);
+    }
+
+    public int getAIRequestTimeoutSeconds() {
+        return getIntFromConfig("AIRequestTimeoutSeconds", Config.AIRequestTimeoutSeconds);
+    }
+
+    public void setAIRequestTimeoutSeconds(int requestTimeoutSeconds) {
+        setValueToConfig("AIRequestTimeoutSeconds", requestTimeoutSeconds);
+    }
+
+    public int getAIConcurrency() {
+        return getIntFromConfig("AIConcurrency", Config.AIConcurrency);
+    }
+
+    public void setAIConcurrency(int concurrency) {
+        setValueToConfig("AIConcurrency", concurrency);
+    }
+
+    public int getAIMaxConcurrency() {
+        return getIntFromConfig("AIMaxConcurrency", Config.AIMaxConcurrency);
+    }
+
+    public void setAIMaxConcurrency(int maxConcurrency) {
+        setValueToConfig("AIMaxConcurrency", maxConcurrency);
+    }
+
+    public int getAIMaxInFlightChars() {
+        return getIntFromConfig("AIMaxInFlightChars", Config.AIMaxInFlightChars);
+    }
+
+    public void setAIMaxInFlightChars(int maxInFlightChars) {
+        setValueToConfig("AIMaxInFlightChars", maxInFlightChars);
+    }
+
+    public int getAIMaxTotalChars() {
+        return getIntFromConfig("AIMaxTotalChars", Config.AIMaxTotalChars);
+    }
+
+    public void setAIMaxTotalChars(int maxTotalChars) {
+        setValueToConfig("AIMaxTotalChars", maxTotalChars);
+    }
+
+    public int getAIMaxRequestChars() {
+        return getIntFromConfig("AIMaxRequestChars", Config.AIMaxRequestChars);
+    }
+
+    public void setAIMaxRequestChars(int maxRequestChars) {
+        setValueToConfig("AIMaxRequestChars", maxRequestChars);
+    }
+
+    public int getAIMaxResponseChars() {
+        return getIntFromConfig("AIMaxResponseChars", Config.AIMaxResponseChars);
+    }
+
+    public void setAIMaxResponseChars(int maxResponseChars) {
+        setValueToConfig("AIMaxResponseChars", maxResponseChars);
+    }
+
+    public int getAIMaxItemsPerMessage() {
+        return getIntFromConfig("AIMaxItemsPerMessage", Config.AIMaxItemsPerMessage);
+    }
+
+    public void setAIMaxItemsPerMessage(int maxItemsPerMessage) {
+        setValueToConfig("AIMaxItemsPerMessage", maxItemsPerMessage);
+    }
+
+    public boolean getAIAnalyzeOncePerMessage() {
+        return getBooleanFromConfig("AIAnalyzeOncePerMessage", Config.AIAnalyzeOncePerMessage);
+    }
+
+    public void setAIAnalyzeOncePerMessage(boolean analyzeOncePerMessage) {
+        setValueToConfig("AIAnalyzeOncePerMessage", analyzeOncePerMessage);
+    }
+
+    public boolean getAISendFullRequest() {
+        return getBooleanFromConfig("AISendFullRequest", Config.AISendFullRequest);
+    }
+
+    public void setAISendFullRequest(boolean sendFullRequest) {
+        setValueToConfig("AISendFullRequest", sendFullRequest);
+    }
+
+    public boolean getAISendFullResponse() {
+        return getBooleanFromConfig("AISendFullResponse", Config.AISendFullResponse);
+    }
+
+    public void setAISendFullResponse(boolean sendFullResponse) {
+        setValueToConfig("AISendFullResponse", sendFullResponse);
+    }
+
+    public boolean getAISkipBinary() {
+        return getBooleanFromConfig("AISkipBinary", Config.AISkipBinary);
+    }
+
+    public void setAISkipBinary(boolean skipBinary) {
+        setValueToConfig("AISkipBinary", skipBinary);
+    }
+
+    public boolean getAISkipStaticResources() {
+        return getBooleanFromConfig("AISkipStaticResources", Config.AISkipStaticResources);
+    }
+
+    public void setAISkipStaticResources(boolean skipStaticResources) {
+        setValueToConfig("AISkipStaticResources", skipStaticResources);
+    }
+
+    public int getAIMaxQueueSize() {
+        return getIntFromConfig("AIMaxQueueSize", Config.AIMaxQueueSize);
+    }
+
+    public void setAIMaxQueueSize(int maxQueueSize) {
+        setValueToConfig("AIMaxQueueSize", maxQueueSize);
+    }
+
+    public boolean getAISaveFullPrompt() {
+        return getBooleanFromConfig("AISaveFullPrompt", Config.AISaveFullPrompt);
+    }
+
+    public void setAISaveFullPrompt(boolean saveFullPrompt) {
+        setValueToConfig("AISaveFullPrompt", saveFullPrompt);
+    }
+
+    public List<AiWhitelistRule> getAIWhitelist() {
+        Object configuredWhitelist = getObjectFromConfig("AIWhitelist", getAIWhitelistConfig());
+        if (!(configuredWhitelist instanceof List<?> rawRules)) {
+            return List.of(defaultAIWhitelistRule());
+        }
+
+        List<AiWhitelistRule> parsedRules = new ArrayList<>();
+        for (Object rawRule : rawRules) {
+            AiWhitelistRule rule = AiWhitelistRule.fromObject(rawRule);
+            if (!rule.getGroup().isBlank() || !rule.getNames().isEmpty()) {
+                parsedRules.add(rule);
+            }
+        }
+        return parsedRules.isEmpty() ? List.of(defaultAIWhitelistRule()) : parsedRules;
+    }
+
+    public void setAIWhitelist(List<AiWhitelistRule> whitelist) {
+        List<Map<String, Object>> yamlWhitelist = new ArrayList<>();
+        for (AiWhitelistRule rule : whitelist) {
+            yamlWhitelist.add(aiWhitelistRuleToMap(rule));
+        }
+        setValueToConfig("AIWhitelist", yamlWhitelist);
+    }
+
     private String getValueFromConfig(String name, String defaultValue) {
+        Object value = getObjectFromConfig(name, defaultValue);
+        return value == null ? defaultValue : value.toString();
+    }
+
+    private boolean getBooleanFromConfig(String name, boolean defaultValue) {
+        Object value = getObjectFromConfig(name, defaultValue);
+        if (value instanceof Boolean booleanValue) {
+            return booleanValue;
+        }
+        if (value != null) {
+            return Boolean.parseBoolean(value.toString());
+        }
+        return defaultValue;
+    }
+
+    private int getIntFromConfig(String name, int defaultValue) {
+        Object value = getObjectFromConfig(name, defaultValue);
+        if (value instanceof Number numberValue) {
+            int parsedValue = numberValue.intValue();
+            return parsedValue > 0 ? parsedValue : defaultValue;
+        }
+        if (value != null) {
+            try {
+                int parsedValue = Integer.parseInt(value.toString());
+                return parsedValue > 0 ? parsedValue : defaultValue;
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return defaultValue;
+    }
+
+    private Object getObjectFromConfig(String name, Object defaultValue) {
         File yamlSetting = new File(configFilePath);
         if (!yamlSetting.exists() || !yamlSetting.isFile()) {
             return defaultValue;
         }
 
         try (InputStream inorder = Files.newInputStream(Paths.get(configFilePath))) {
-            Map<String, Object> r = new Yaml().load(inorder);
+            Map<String, Object> r = yaml.load(inorder);
 
-            if (r.containsKey(name)) {
-                return r.get(name).toString();
+            if (r != null && r.containsKey(name)) {
+                return r.get(name);
             }
         } catch (Exception ignored) {
         }
@@ -224,7 +499,7 @@ public class ConfigLoader {
         return defaultValue;
     }
 
-    private void setValueToConfig(String name, String value) {
+    private void setValueToConfig(String name, Object value) {
         Map<String, Object> currentConfig = loadCurrentConfig();
         currentConfig.put(name, value);
 
@@ -241,10 +516,26 @@ public class ConfigLoader {
         }
 
         try (InputStream in = Files.newInputStream(path)) {
-            return yaml.load(in);
+            Map<String, Object> currentConfig = yaml.load(in);
+            return currentConfig == null ? new LinkedHashMap<>() : currentConfig;
         } catch (Exception e) {
             return new LinkedHashMap<>(); // 读取失败时也返回空的Map
         }
+    }
+
+    private List<Map<String, Object>> getAIWhitelistConfig() {
+        return List.of(aiWhitelistRuleToMap(defaultAIWhitelistRule()));
+    }
+
+    private AiWhitelistRule defaultAIWhitelistRule() {
+        return new AiWhitelistRule(Config.AIWhitelistGroup, Config.AIWhitelistNames);
+    }
+
+    private Map<String, Object> aiWhitelistRuleToMap(AiWhitelistRule rule) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("group", rule.getGroup());
+        entry.put("names", new ArrayList<>(rule.getNames()));
+        return entry;
     }
 
     public boolean initRules() {

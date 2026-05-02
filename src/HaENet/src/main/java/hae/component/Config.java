@@ -2,6 +2,8 @@ package hae.component;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
+import hae.component.board.DataboardAiSettingsController;
+import hae.component.board.DataboardAiSettingsPanel;
 import hae.component.board.message.MessageTableModel;
 import hae.component.rule.Rules;
 import hae.instances.http.HttpMessageActiveHandler;
@@ -28,6 +30,7 @@ public class Config extends JPanel {
     private final ConfigLoader configLoader;
     private final MessageTableModel messageTableModel;
     private final Rules rules;
+    private final DataboardAiSettingsController.WorkerControls aiWorkerControls;
 
     private Registration activeHandler;
     private Registration passiveHandler;
@@ -35,10 +38,19 @@ public class Config extends JPanel {
     private boolean isLoadingData = false;
 
     public Config(MontoyaApi api, ConfigLoader configLoader, MessageTableModel messageTableModel, Rules rules) {
+        this(api, configLoader, messageTableModel, rules, null);
+    }
+
+    public Config(MontoyaApi api,
+                  ConfigLoader configLoader,
+                  MessageTableModel messageTableModel,
+                  Rules rules,
+                  DataboardAiSettingsController.WorkerControls aiWorkerControls) {
         this.api = api;
         this.configLoader = configLoader;
         this.messageTableModel = messageTableModel;
         this.rules = rules;
+        this.aiWorkerControls = aiWorkerControls;
 
         this.activeHandler = api.http().registerHttpHandler(new HttpMessageActiveHandler(api, configLoader, messageTableModel));
         this.passiveHandler = api.scanner().registerScanCheck(new HttpMessagePassiveHandler(api, configLoader, messageTableModel));
@@ -127,6 +139,12 @@ public class Config extends JPanel {
         settingPanel.add(northPanel, BorderLayout.NORTH);
 
         configTabbedPanel.add("Setting", settingPanel);
+        configTabbedPanel.add("AI", new DataboardAiSettingsPanel(new DataboardAiSettingsController(
+                configLoader,
+                messageTableModel.getAiTaskRepositoryForSettings(),
+                aiWorkerControls,
+                null
+        )));
         add(ruleInfoPanel, BorderLayout.NORTH);
         add(configTabbedPanel, BorderLayout.CENTER);
     }
