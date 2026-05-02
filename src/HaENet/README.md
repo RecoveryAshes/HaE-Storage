@@ -14,6 +14,12 @@
 
 1. HaE Network 3.0 起采用 `Montoya API` 开发，需使用 BurpSuite `>= 2023.12.1`。
 2. 自定义规则中，需提取的内容必须由括号 `()` 包裹。例如匹配 `rememberMe=delete`，应写作 `(rememberMe=delete)`。
+3. AI Sensitive Triage 默认关闭，仅在正则处理成功后，对命中默认白名单的 HTTP 报文入队。v1 是 HTTP-only，WebSocket triage unsupported 并会跳过。
+4. AI verdicts are advisory triage hints，不代表漏洞可利用、数据泄露已确认或合规状态已证明。
+5. 默认 AI 客户端是 direct no-proxy，不使用 Burp Montoya HTTP send、Burp Proxy、Burp HTTP API 或系统代理。若未来启用代理能力，AI API 调用可能出现在 Burp Logger/Proxy 中。
+6. API key 写入 `Config.yml` 时是 plaintext。也可配置字面量 `env:HAE_AI_API_KEY`，扩展只在运行时读取环境变量值。
+7. SQLite 只保存 AI task/result metadata 与 AI response JSON，不保存 full prompt，也不在 AI 表中重复保存原始 request/response payload。
+8. 默认 AI 白名单排除 Linkfinder、All URL 等噪声规则，避免低价值 URL-only triage。
 
 ## 近期更新（2026-02）
 

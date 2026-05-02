@@ -2,13 +2,11 @@ package hae.instances.editor;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ByteArray;
-import burp.api.montoya.core.Range;
 import burp.api.montoya.ui.Selection;
 import burp.api.montoya.ui.contextmenu.WebSocketMessage;
 import burp.api.montoya.ui.editor.extension.EditorCreationContext;
 import burp.api.montoya.ui.editor.extension.ExtensionProvidedWebSocketMessageEditor;
 import burp.api.montoya.ui.editor.extension.WebSocketMessageEditorProvider;
-import hae.component.board.table.Datatable;
 import hae.instances.http.utils.MessageProcessor;
 import hae.utils.ConfigLoader;
 
@@ -55,7 +53,7 @@ public class WebSocketEditor implements WebSocketMessageEditorProvider {
         @Override
         public void setMessage(WebSocketMessage webSocketMessage) {
             this.message = webSocketMessage.payload();
-            RequestEditor.generateTabbedPaneFromResultMap(api, configLoader, jTabbedPane, this.dataList);
+            EditorUtils.generateTabbedPaneFromResultMap(api, configLoader, jTabbedPane, this.dataList);
         }
 
         @Override
@@ -63,7 +61,7 @@ public class WebSocketEditor implements WebSocketMessageEditorProvider {
             String websocketMessage = webSocketMessage.payload().toString();
             if (!websocketMessage.isEmpty()) {
                 this.dataList = messageProcessor.processMessage("", websocketMessage, false);
-                return RequestEditor.isListHasData(this.dataList);
+                return EditorUtils.isListHasData(this.dataList);
             }
             return false;
         }
@@ -80,18 +78,7 @@ public class WebSocketEditor implements WebSocketMessageEditorProvider {
 
         @Override
         public Selection selectedData() {
-            return new Selection() {
-                @Override
-                public ByteArray contents() {
-                    Datatable dataTable = (Datatable) jTabbedPane.getSelectedComponent();
-                    return ByteArray.byteArray(dataTable.getSelectedDataAtTable(dataTable.getDataTable()));
-                }
-
-                @Override
-                public Range offsets() {
-                    return null;
-                }
-            };
+            return EditorUtils.selectedDataFrom(jTabbedPane);
         }
 
         @Override

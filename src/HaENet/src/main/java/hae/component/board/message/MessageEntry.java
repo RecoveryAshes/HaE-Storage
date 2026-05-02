@@ -10,8 +10,67 @@ public class MessageEntry {
     private final String color;
     private final String method;
     private final String contentHash;
+    private final String aiStatus;
+    private final String aiVerdict;
+    private final String aiRiskLevel;
+    private final String aiConfidence;
+    private final String aiSummary;
+    private final String aiTargetRuleName;
+    private final String aiTargetValue;
+    private final String aiTargetSignatureHash;
 
-    MessageEntry(String messageId, String method, String url, String comment, String length, String color, String status, String contentHash) {
+    public MessageEntry(String messageId, String method, String url, String comment, String length, String color, String status, String contentHash) {
+        this(messageId, method, url, comment, length, color, status, contentHash, "", "", "", "", "");
+    }
+
+    public MessageEntry(String messageId,
+                        String method,
+                        String url,
+                        String comment,
+                        String length,
+                        String color,
+                        String status,
+                        String contentHash,
+                        String aiTargetRuleName,
+                        String aiTargetValue,
+                        String aiTargetSignatureHash) {
+        this(messageId, method, url, comment, length, color, status, contentHash,
+                "", "", "", "", "", aiTargetRuleName, aiTargetValue, aiTargetSignatureHash);
+    }
+
+    public MessageEntry(String messageId,
+                        String method,
+                        String url,
+                        String comment,
+                        String length,
+                        String color,
+                        String status,
+                        String contentHash,
+                        String aiStatus,
+                        String aiVerdict,
+                        String aiRiskLevel,
+                        String aiConfidence,
+                        String aiSummary) {
+        this(messageId, method, url, comment, length, color, status, contentHash, aiStatus, aiVerdict,
+                aiRiskLevel, aiConfidence, aiSummary, "", "", "");
+    }
+
+    public MessageEntry(String messageId,
+                        String method,
+                        String url,
+                        String comment,
+                        String length,
+                        String color,
+                        String status,
+                        String contentHash,
+                        String aiStatus,
+                        String aiVerdict,
+                        String aiRiskLevel,
+                        String aiConfidence,
+                        String aiSummary,
+                        String aiTargetRuleName,
+                        String aiTargetValue,
+                        String aiTargetSignatureHash) {
         this.messageId = messageId;
         this.method = method;
         this.url = url;
@@ -20,6 +79,14 @@ public class MessageEntry {
         this.color = color;
         this.status = status;
         this.contentHash = contentHash;
+        this.aiStatus = aiStatus;
+        this.aiVerdict = aiVerdict;
+        this.aiRiskLevel = aiRiskLevel;
+        this.aiConfidence = aiConfidence;
+        this.aiSummary = aiSummary;
+        this.aiTargetRuleName = aiTargetRuleName;
+        this.aiTargetValue = aiTargetValue;
+        this.aiTargetSignatureHash = aiTargetSignatureHash;
     }
 
     public String getMessageId() {
@@ -52,5 +119,37 @@ public class MessageEntry {
 
     public String getContentHash() {
         return this.contentHash;
+    }
+
+    public String getAiStatus() {
+        return this.aiStatus;
+    }
+
+    public String getAiVerdict() {
+        return this.aiVerdict;
+    }
+
+    public String getAiRiskLevel() {
+        return this.aiRiskLevel;
+    }
+
+    public String getAiConfidence() {
+        return this.aiConfidence;
+    }
+
+    public String getAiSummary() {
+        return this.aiSummary;
+    }
+
+    public String getAiTargetRuleName() {
+        return this.aiTargetRuleName;
+    }
+
+    public String getAiTargetValue() {
+        return this.aiTargetValue;
+    }
+
+    public String getAiTargetSignatureHash() {
+        return this.aiTargetSignatureHash;
     }
 }

@@ -65,6 +65,52 @@ public class Config {
 
     public static Boolean proVersionStatus = true;
 
+    public static Boolean AIEnabled = false;
+
+    public static Boolean AIUseBurpProxy = false;
+
+    public static String AIProviderType = "openai-compatible";
+
+    public static String AIBaseUrl = "";
+
+    public static String AIModel = "";
+
+    public static String AIApiKey = "";
+
+    public static Integer AIRequestTimeoutSeconds = 180;
+
+    public static Integer AIConcurrency = 2;
+
+    public static Integer AIMaxConcurrency = 8;
+
+    public static Integer AIMaxInFlightChars = 2000000;
+
+    public static Integer AIMaxTotalChars = 800000;
+
+    public static Integer AIMaxRequestChars = 200000;
+
+    public static Integer AIMaxResponseChars = 600000;
+
+    public static Integer AIMaxItemsPerMessage = 50;
+
+    public static Boolean AIAnalyzeOncePerMessage = true;
+
+    public static Boolean AISendFullRequest = true;
+
+    public static Boolean AISendFullResponse = true;
+
+    public static Boolean AISkipBinary = true;
+
+    public static Boolean AISkipStaticResources = true;
+
+    public static Integer AIMaxQueueSize = 10000;
+
+    public static Boolean AISaveFullPrompt = false;
+
+    public static String AIWhitelistGroup = "敏感信息";
+
+    public static List<String> AIWhitelistNames = List.of("JSON Web Token", "JWT", "idCard", "身份证");
+
     public static Map<String, Object[][]> globalRules = new ConcurrentHashMap<>();
 
     public static ConcurrentHashMap<String, Map<String, List<String>>> globalDataMap = new ConcurrentHashMap<>();
